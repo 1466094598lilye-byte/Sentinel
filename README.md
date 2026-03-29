@@ -144,6 +144,12 @@ lib/reporter.ts       — Triage report (RED/YLW/GRN), shuffled context for isla
 lib/concurrency.ts    — Semaphore-based concurrency, async exec, configurable limits
 ```
 
+## Acknowledgments
+
+- Git scope auto-detection (commit/branch/full) inspired by [expect-cli](https://github.com/anthropics/anthropic-cookbook/tree/main/misc/expect-cli)
+- Island algorithm concept drawn from [BugBot](https://cursor.com/bugbot) (multi-pass + majority voting) and [Strix](https://github.com/usestrix/strix) (skill injection)
+- Hacker methodology informed by [Shannon](https://github.com/KeygraphHQ/shannon) (white-box CPG approach) and [PentAGI](https://github.com/vxcontrol/pentagi) (multi-agent + knowledge graph)
+
 ## License
 
 MIT
