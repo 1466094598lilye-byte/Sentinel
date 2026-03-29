@@ -1,0 +1,16 @@
+{
+  "name": "sentinel",
+  "version": "0.1.0",
+  "description": "Sentinel — AI testing agent plugin for OpenClaw. Dual-perspective testing: Tester validates spec, Hacker finds blind spots. Real test execution via vitest/pytest.",
+  "author": "Lily Huang",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.2"
+  }
+}

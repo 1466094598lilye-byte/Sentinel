@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+*.js
+*.js.map
+*.d.ts
+.DS_Store
+UX_FRUSTRATION_ATLAS.md
