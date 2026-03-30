@@ -65,6 +65,49 @@ Scan detects your project size, language build speed, machine specs, and environ
 
 ## Usage
 
+### CLI (standalone, no framework needed)
+
+```bash
+# Install
+npm install -g sentinel
+# or use directly with npx
+npx sentinel ./my-project
+
+# Scan — detect language, git scope, API surface
+sentinel scan ./my-project
+
+# Run — execute existing tests in __sentinel__/
+sentinel run ./my-project
+
+# Context — get full prompts (PM + Tester + Hacker) to feed to any LLM
+sentinel context ./my-project
+```
+
+Every run writes a `sentinel-report.md` to the project root — open it to see full triage details and raw test output.
+
+```bash
+# CI pipeline (JSON output, exit code 0 = pass, 1 = fail)
+sentinel run ./my-project --json
+
+# Override scope, custom test dir, save tests back to project
+sentinel run ./my-project --scope full --tests ./my-tests --save --timeout 600000
+```
+
+| Command | What it does |
+|---------|-------------|
+| `sentinel <target>` | Auto: scan, then run if `__sentinel__/` exists |
+| `sentinel scan <target>` | Print project context + proposed config |
+| `sentinel run <target>` | Execute tests, write `sentinel-report.md` |
+| `sentinel context <target>` | Print prompts for manual LLM use |
+
+| Flag | Description |
+|------|-------------|
+| `--scope <commit\|branch\|changes\|full>` | Override auto-detected git scope |
+| `--tests <dir>` | Custom test directory (default: `__sentinel__/`) |
+| `--save` | Copy test files back to project after run |
+| `--json` | JSON output for CI pipelines |
+| `--timeout <ms>` | Test execution timeout (default: 300000) |
+
 ### As an OpenClaw plugin
 
 ```json
@@ -75,46 +118,40 @@ Scan detects your project size, language build speed, machine specs, and environ
 }
 ```
 
-Then use the tools: `sentinel_scan` → `sentinel_pm` → `sentinel_test` → `sentinel_hack` → `sentinel_run`
+Then use the tools: `sentinel_scan` → `sentinel_config` → `sentinel_pm` → `sentinel_test` → `sentinel_hack` → `sentinel_run`
 
 ### As a library
 
 ```typescript
 import { scan } from "sentinel/lib/detect";
-import { proposeConfig } from "sentinel/lib/config";
 import { createWorkspace, installDeps, writeTestFiles, destroyWorkspace } from "sentinel/lib/workspace";
 import { runTests } from "sentinel/lib/executor";
 import { formatReport } from "sentinel/lib/reporter";
 
-// 1. Scan the target project
-const result = scan("/path/to/any/project");
-const config = proposeConfig(result);
-
-// 2. Create isolated workspace + run tests
-const ws = createWorkspace("/path/to/any/project", result.language);
+const result = scan("/path/to/project");
+const ws = createWorkspace("/path/to/project", result.language);
 await installDeps(ws);
 writeTestFiles(ws, { "my.test.ts": testCode });
-const testResult = await runTests(ws);
-
-// 3. Get triaged report
-const report = formatReport(result, testResult);
-console.log(report.summary);  // RED/YLW/GRN classified
+const report = formatReport(result, await runTests(ws));
+console.log(report.summary);
 destroyWorkspace(ws);
 ```
 
 ### With any AI agent
 
-Sentinel's prompts (PM, Tester, Hacker) are plain text templates. You can feed them to any LLM — Claude, GPT, Gemini, local models — and pipe the output back through `sentinel_run` to execute the generated tests. The island algorithm works with any model.
+Run `sentinel context ./my-project` to get plain text prompts (PM, Tester, Hacker). Feed them to any LLM — Claude, GPT, Gemini, local models — save the generated tests to `__sentinel__/`, then `sentinel run` to execute. The island algorithm works with any model.
 
 ## Pipeline
 
 ```
-sentinel_scan    →  Detect language, extract API surface, propose config
-sentinel_config  →  User confirms timeouts, concurrency, island rounds
-sentinel_pm      →  Market research → 4-tier island analysis → cross-pollinate → merge
-sentinel_test    →  System Tester (correctness) + User Tester (PM thresholds → runnable tests)
-sentinel_hack    →  6-skill island attack → cross-pollinate chains → merge
-sentinel_run     →  Execute in isolated workspace, return triaged RED/YLW/GRN report
+CLI                                      OpenClaw plugin
+───                                      ──────────────
+sentinel scan        ←→                  sentinel_scan
+                                         sentinel_config
+sentinel context     ←→                  sentinel_pm → sentinel_test → sentinel_hack
+sentinel run         ←→                  sentinel_run
+       ↓
+sentinel-report.md                       (inline report)
 ```
 
 ## Demo
@@ -134,7 +171,8 @@ Tested on [memgraph-plugin](https://github.com/lilyhuang-github/memgraph-plugin)
 ## Architecture
 
 ```
-index.ts              — Tool registration, prompts, island algorithm orchestration
+bin/sentinel.ts       — CLI entry point (scan, run, context commands, report generation)
+index.ts              — OpenClaw plugin (tool registration, prompts, island algorithm)
 lib/detect.ts         — Language detection, git scope, API surface extraction (9 languages)
 lib/runners.ts        — Per-language runner config table (install, test, cache isolation)
 lib/config.ts         — Smart config proposal (project size × language × environment)
