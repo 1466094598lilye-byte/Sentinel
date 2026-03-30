@@ -28,6 +28,8 @@ import { runTests } from "./lib/executor.js";
 import { formatReport, formatScanContext, formatScanContextShuffled, formatFailureContext } from "./lib/reporter.js";
 import { proposeConfig, formatConfigProposal, getConfig, setConfig, clearConfig } from "./lib/config.js";
 import { syncSemaphores } from "./lib/concurrency.js";
+import { calibrate } from "./lib/calibrate.js";
+import { detectProvider } from "./lib/llm.js";
 import type { SentinelConfig } from "./lib/config.js";
 import type { ScanResult } from "./lib/detect.js";
 import type { Workspace } from "./lib/workspace.js";
@@ -35,6 +37,8 @@ import type { Workspace } from "./lib/workspace.js";
 // ── State ──
 const activeWorkspaces = new Map<string, Workspace>();
 const lastScanResults = new Map<string, ScanResult>();
+const lastIntent = new Map<string, string>();      // user's one-line project intent
+const lastCalibration = new Map<string, string>(); // LLM-generated capability expectations
 const lastPMCriteria = new Map<string, string>();
 const lastTesterPlan = new Map<string, string>();
 const hackRound = new Map<string, number>(); // current round per session
@@ -550,7 +554,7 @@ export default function register(api: any) {
     (ctx: any) => ({
       name: "sentinel_scan",
       description:
-        "Scan a project for testing: detect language, analyze git changes, extract API surface. Returns context and PM prompt for generating UX acceptance criteria. Call this first.",
+        "Scan a project for testing. Pass intent (one sentence: what is this project for?) to enable intent-gap detection. If intent is not provided, ASK THE USER before proceeding.",
       inputSchema: {
         type: "object",
         properties: {
@@ -563,10 +567,14 @@ export default function register(api: any) {
             enum: ["commit", "branch", "changes", "full"],
             description: "Test scope. If omitted, auto-detected from git state.",
           },
+          intent: {
+            type: "string",
+            description: 'One sentence from the user: "What is this project for?" e.g. "A CLI tool that tests any codebase from four perspectives." If unknown, ASK the user first.',
+          },
         },
         required: ["target"],
       },
-      async handler(params: { target: string; scope?: string }) {
+      async handler(params: { target: string; scope?: string; intent?: string }) {
         try {
           const sessionKey = ctx.sessionKey || "default";
 
@@ -577,17 +585,52 @@ export default function register(api: any) {
           lastScanResults.set(sessionKey, result);
           lastScanDiffHash.set(sessionKey, getGitDiffFingerprint(params.target));
 
+          // Store intent
+          if (params.intent) {
+            lastIntent.set(sessionKey, params.intent);
+          }
+
           const context = formatScanContext(result);
           const proposed = proposeConfig(result);
 
-          const output = [
-            context,
-            "",
-            formatConfigProposal(proposed, result),
-          ].join("\n");
+          const parts = [context, "", formatConfigProposal(proposed, result)];
+
+          if (!params.intent) {
+            // No intent — nudge agent to ask user
+            parts.push("");
+            parts.push("---");
+            parts.push("## Calibration Required");
+            parts.push('Before proceeding to PM, ask the user ONE question: **"What is this project for?"**');
+            parts.push("Then call sentinel_scan again with `intent` to run calibration.");
+          } else {
+            // Intent provided — run LLM calibration if API key available
+            parts.push("");
+            parts.push(`## Project Intent`);
+            parts.push(`> ${params.intent}`);
+
+            if (detectProvider()) {
+              log.info(`[sentinel] Running intent calibration...`);
+              try {
+                const cal = await calibrate(params.intent, result);
+                lastCalibration.set(sessionKey, cal.expectedCapabilities);
+                parts.push("");
+                parts.push("## Intent Calibration (LLM analysis)");
+                parts.push(cal.expectedCapabilities);
+              } catch (err: any) {
+                log.warn(`[sentinel] Calibration failed: ${err?.message}`);
+                parts.push("");
+                parts.push(`(Calibration failed: ${err?.message} — proceeding without intent-gap detection)`);
+              }
+            } else {
+              parts.push("");
+              parts.push("(No LLM API key found — set ANTHROPIC_API_KEY or OPENAI_API_KEY for intent-gap detection)");
+            }
+          }
+
+          const output = parts.join("\n");
 
           log.info(
-            `[sentinel] Scan complete: ${result.language}, scope=${result.scope}, ${result.sourceFiles.length} files, ${result.apiSurface.length} exports`,
+            `[sentinel] Scan complete: ${result.language}, scope=${result.scope}, ${result.sourceFiles.length} files, ${result.apiSurface.length} exports, intent=${params.intent ? "yes" : "pending"}`,
           );
 
           return {
@@ -624,13 +667,19 @@ export default function register(api: any) {
           maxConcurrentTests: { type: "number", description: "Max parallel test executions" },
           environment: { type: "string", enum: ["local", "server", "ci"], description: "Runtime environment" },
           sleepProtection: { type: "boolean", description: "Extend timeouts for machines that may sleep" },
+          intent: { type: "string", description: 'User\'s one-line project intent, if not provided during scan. e.g. "A CLI tool that tests any codebase."' },
         },
         required: [],
       },
-      async handler(params: Partial<SentinelConfig>) {
+      async handler(params: Partial<SentinelConfig> & { intent?: string }) {
         try {
           const sessionKey = ctx.sessionKey || "default";
           const scanResult = lastScanResults.get(sessionKey);
+
+          // Accept intent here if not provided during scan
+          if (params.intent) {
+            lastIntent.set(sessionKey, params.intent);
+          }
 
           if (!scanResult) {
             return {
@@ -752,9 +801,14 @@ export default function register(api: any) {
 
             // Return research prompt for the agent to execute
             const sourceContext = formatScanContext(scanResult);
+            const calResult = lastCalibration.get(sessionKey);
+            const intentBlock = calResult
+              ? `## Intent Calibration\nThe following capability analysis was generated from the user's stated purpose. Use the [GAP] items to guide competitive research — these are things the project SHOULD have but doesn't.\n\n${calResult}\n`
+              : "";
             const output = [
               `# PM Market Research Phase`,
               "",
+              intentBlock,
               sourceContext,
               "",
               PM_RESEARCH_PROMPT,
@@ -781,6 +835,12 @@ export default function register(api: any) {
             const tierSection = `## Analysis focus: Tier ${t.id} — ${t.name}\n${t.prompt}`;
             const outputFmt = PM_OUTPUT_FORMAT.replace("{TIER_ID}", String(t.id));
 
+            // Intent calibration — LLM-analyzed capability expectations
+            const calResult = lastCalibration.get(sessionKey);
+            const intentBlock = calResult
+              ? `## Intent Calibration\nThe following capability analysis was generated from the user's stated purpose. Intent gaps ([GAP] items) are **T1 findings** — the most critical category.\n\n${calResult}\n`
+              : "";
+
             const nextHint = tier < 4
               ? `\n\n---\nNext: call sentinel_pm with tier=${tier + 1} to continue.`
               : `\n\n---\nAll 4 tiers complete. Call sentinel_pm with tier="cross" and tierResults=<all 4 results concatenated>.`;
@@ -788,6 +848,7 @@ export default function register(api: any) {
             const output = [
               `# PM Island ${tier}/4 (Round ${round}) — ${t.name}`,
               "",
+              intentBlock,
               shuffledContext,
               "",
               prompt,

@@ -25,14 +25,18 @@ import { formatReport, formatScanContext } from "../lib/reporter.js";
 import { proposeConfig, setConfig, formatConfigProposal } from "../lib/config.js";
 import { syncSemaphores } from "../lib/concurrency.js";
 import { checkEnv } from "../lib/runners.js";
+import { calibrate } from "../lib/calibrate.js";
+import { detectProvider } from "../lib/llm.js";
+import { runPipeline } from "../lib/pipeline.js";
 import type { ScanResult } from "../lib/detect.js";
 
 // ── Arg parsing ──
 
 interface CliArgs {
-  command: "scan" | "run" | "context" | "auto";
+  command: "scan" | "run" | "test" | "context" | "auto";
   target: string;
   scope?: string;
+  intent?: string;
   testsDir?: string;
   save: boolean;
   json: boolean;
@@ -52,6 +56,8 @@ function parseArgs(argv: string[]): CliArgs {
       flags.tests = args[++i];
     } else if (args[i] === "--timeout" && args[i + 1]) {
       flags.timeout = args[++i];
+    } else if (args[i] === "--intent" && args[i + 1]) {
+      flags.intent = args[++i];
     } else if (args[i] === "--save") {
       flags.save = true;
     } else if (args[i] === "--json") {
@@ -71,7 +77,7 @@ function parseArgs(argv: string[]): CliArgs {
   let command: CliArgs["command"] = "auto";
   let target: string;
 
-  const knownCommands = ["scan", "run", "context"];
+  const knownCommands = ["scan", "run", "test", "context"];
   if (positional.length >= 2 && knownCommands.includes(positional[0])) {
     command = positional[0] as CliArgs["command"];
     target = resolve(positional[1]);
@@ -91,6 +97,7 @@ function parseArgs(argv: string[]): CliArgs {
     command,
     target,
     scope: flags.scope as string | undefined,
+    intent: flags.intent as string | undefined,
     testsDir: flags.tests as string | undefined,
     save: !!flags.save,
     json: !!flags.json,
@@ -103,24 +110,31 @@ function printUsage() {
 Sentinel — AI testing agent
 
 Usage:
-  sentinel <target>                  Scan + run existing tests
-  sentinel scan <target>             Scan project, print context
-  sentinel run <target>              Run tests from __sentinel__/
-  sentinel context <target>          Print full prompts (PM + Tester + Hacker)
+  sentinel test <target>             Full pipeline: scan → LLM generates tests → run → report
+  sentinel test <target> --intent "what this project is for"
+  sentinel scan <target>             Scan only (no LLM needed)
+  sentinel run <target>              Run existing tests from __sentinel__/
+  sentinel <target>                  Auto: test if API key available, else scan + run existing
 
 Options:
+  --intent <text>     What is this project for? (enables intent-gap detection)
   --scope <scope>     Override scope: commit | branch | changes | full
   --tests <dir>       Custom test file directory (default: __sentinel__/)
-  --save              Save test files back to project after run
+  --save              Save generated test files back to project
   --json              Output results as JSON (for CI pipelines)
   --timeout <ms>      Test execution timeout (default: 300000)
   -h, --help          Show this help
 
+API Key:
+  Set ANTHROPIC_API_KEY or OPENAI_API_KEY in your environment, .env file,
+  or ~/.sentinel/.env. If not found, Sentinel will ask you to paste it.
+
 Examples:
-  sentinel .                         # scan + test current directory
-  sentinel scan ~/my-project         # scan only
-  sentinel run . --tests ./tests     # run custom test dir
-  sentinel . --scope full --json     # full scan, JSON output for CI
+  sentinel test .                                 # full AI pipeline
+  sentinel test . --intent "CLI testing tool"     # with intent calibration
+  sentinel test . --save                          # keep generated tests
+  sentinel run .                                  # re-run existing tests
+  sentinel scan .                                 # just scan, no LLM
 `);
 }
 
@@ -132,13 +146,13 @@ function log(msg: string) {
 
 // ── Commands ──
 
-function cmdScan(scanResult: ScanResult, args: CliArgs): void {
+async function cmdScan(scanResult: ScanResult, args: CliArgs): Promise<void> {
   const context = formatScanContext(scanResult);
   const config = proposeConfig(scanResult);
   const configSummary = formatConfigProposal(config, scanResult);
 
   if (args.json) {
-    const output = {
+    const output: any = {
       language: scanResult.language,
       scope: scanResult.scope,
       changedFiles: scanResult.changedFiles,
@@ -146,11 +160,147 @@ function cmdScan(scanResult: ScanResult, args: CliArgs): void {
       apiSurface: scanResult.apiSurface.length,
       existingTests: scanResult.existingTests.length,
     };
+
+    if (args.intent) {
+      output.intent = args.intent;
+      if (detectProvider()) {
+        const cal = await calibrate(args.intent, scanResult);
+        output.calibration = cal.expectedCapabilities;
+      }
+    }
+
     console.log(JSON.stringify(output, null, 2));
   } else {
     console.log(context);
     console.log();
     console.log(configSummary);
+
+    if (args.intent) {
+      console.log();
+      console.log(`## Project Intent`);
+      console.log(`> ${args.intent}`);
+
+      if (detectProvider()) {
+        log("Running intent calibration...");
+        try {
+          const cal = await calibrate(args.intent, scanResult);
+          console.log();
+          console.log("## Intent Calibration");
+          console.log(cal.expectedCapabilities);
+        } catch (err: any) {
+          log(`Calibration failed: ${err?.message}`);
+        }
+      } else {
+        console.log();
+        console.log("(Set ANTHROPIC_API_KEY or OPENAI_API_KEY for intent-gap detection)");
+      }
+    }
+  }
+}
+
+async function cmdTest(scanResult: ScanResult, args: CliArgs): Promise<number> {
+  // Full pipeline: LLM generates everything, then run
+  log("Starting full AI pipeline...");
+
+  const pipelineResult = await runPipeline(scanResult, args.intent, {
+    onPhase: (phase) => log(phase),
+  });
+
+  const fileCount = Object.keys(pipelineResult.testFiles).length;
+  if (fileCount === 0) {
+    console.error("LLM did not generate any test files. Check the merged plan output.");
+    console.error("This usually means the LLM response didn't use the expected --- FILE: --- format.");
+    return 1;
+  }
+
+  log(`LLM generated ${fileCount} test files. Setting up workspace...`);
+
+  // Setup config
+  const config = proposeConfig(scanResult);
+  config.testTimeout = args.timeout;
+  setConfig(config);
+  syncSemaphores();
+
+  // Create workspace
+  const ws = createWorkspace(args.target, scanResult.language);
+
+  try {
+    // Install deps
+    log("Installing dependencies...");
+    const installResult = await installDeps(ws);
+    if (!installResult.success) {
+      console.error("Dependency installation failed:");
+      console.error(installResult.output.slice(0, 3000));
+      return 1;
+    }
+
+    // Write LLM-generated test files
+    writeTestFiles(ws, pipelineResult.testFiles);
+    log(`Wrote ${fileCount} test files`);
+
+    // Run tests
+    log("Running tests...");
+    const result = await runTests(ws);
+
+    // Report
+    const report = formatReport(scanResult, result);
+
+    if (args.json) {
+      const output = {
+        overall: report.overall,
+        passRate: report.passRate,
+        totalTests: result.totalTests,
+        passed: result.passed,
+        failed: result.failed,
+        duration: result.duration,
+        failures: result.failures.map((f) => ({
+          file: f.testFile,
+          test: f.testName,
+          error: f.error,
+          expected: f.expected,
+          actual: f.actual,
+        })),
+        calibration: pipelineResult.calibration?.expectedCapabilities || null,
+      };
+      console.log(JSON.stringify(output, null, 2));
+    } else {
+      console.log();
+      console.log(report.summary);
+      console.log(report.details);
+    }
+
+    // Write full report
+    const reportPath = join(args.target, "sentinel-report.md");
+    const fullReport = [
+      report.summary,
+      report.details,
+      "",
+      pipelineResult.calibration ? `---\n## Intent Calibration\n${pipelineResult.calibration.expectedCapabilities}\n` : "",
+      "---",
+      "## Raw Test Output",
+      "```",
+      result.rawOutput,
+      "```",
+    ].join("\n");
+    writeFileSync(reportPath, fullReport, "utf-8");
+
+    if (result.failed > 0) {
+      log(`Report written to: ${reportPath}`);
+      log(`Open it to see full failure details and raw test output.`);
+    } else {
+      log(`Report: ${reportPath}`);
+    }
+
+    // Save test files to project if requested
+    if (args.save) {
+      const savedDir = saveTestFiles(ws, args.target);
+      log(`Test files saved to: ${savedDir}`);
+    }
+
+    log(`Done: ${result.passed}/${result.totalTests} passed`);
+    return result.failed > 0 ? 1 : 0;
+  } finally {
+    destroyWorkspace(ws);
   }
 }
 
@@ -326,8 +476,14 @@ async function main() {
   log(`Detected: ${scanResult.language}, scope=${scanResult.scope}, ${scanResult.sourceFiles.length} files, ${scanResult.apiSurface.length} exports`);
 
   switch (args.command) {
+    case "test": {
+      const code = await cmdTest(scanResult, args);
+      process.exit(code);
+      break;
+    }
+
     case "scan":
-      cmdScan(scanResult, args);
+      await cmdScan(scanResult, args);
       break;
 
     case "context":
@@ -341,22 +497,27 @@ async function main() {
     }
 
     case "auto": {
-      // Auto mode: scan first, then run if tests exist
+      // Auto mode: if API key available, full pipeline; otherwise run existing tests
       const env = checkEnv(scanResult.language, args.target);
       const testDir = join(args.target, env.runner?.testFileDir || "__sentinel__");
 
-      if (existsSync(testDir)) {
-        log(`Found test directory: ${testDir}`);
+      if (detectProvider()) {
+        // Has LLM — run full pipeline
+        log("API key detected — running full AI pipeline");
+        const code = await cmdTest(scanResult, args);
+        process.exit(code);
+      } else if (existsSync(testDir)) {
+        // No LLM but has existing tests — run them
+        log(`No API key, but found existing tests at ${basename(testDir)}/`);
         const code = await cmdRun(scanResult, args);
         process.exit(code);
       } else {
-        // No tests yet — just scan
-        cmdScan(scanResult, args);
+        // Nothing — scan only
+        await cmdScan(scanResult, args);
         console.log();
         console.log("---");
-        console.log(`No test directory found at ${basename(testDir)}/`);
-        console.log("Run 'sentinel context' to generate prompts for your LLM,");
-        console.log(`or create test files in ${basename(testDir)}/ and re-run.`);
+        console.log("No API key and no existing test files.");
+        console.log("Set ANTHROPIC_API_KEY or OPENAI_API_KEY, then run: sentinel test <target>");
       }
       break;
     }
