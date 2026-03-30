@@ -65,33 +65,70 @@ Scan detects your project size, language build speed, machine specs, and environ
 
 ## Usage
 
-### CLI (standalone, no framework needed)
+### MCP Server (recommended)
+
+Sentinel works as an MCP server with any compatible AI coding tool. Install once, then use `sentinel_scan` → `sentinel_pm` → `sentinel_test` → `sentinel_hack` → `sentinel_run` from your editor.
+
+#### Claude Code
+
+Use `--scope user` so Sentinel is available across all projects (Claude Code's default local scope only works from the exact directory where the command was run):
 
 ```bash
-# Install
-npm install -g sentinel
-# or use directly with npx
-npx sentinel ./my-project
-
-# Scan — detect language, git scope, API surface
-sentinel scan ./my-project
-
-# Run — execute existing tests in __sentinel__/
-sentinel run ./my-project
-
-# Context — get full prompts (PM + Tester + Hacker) to feed to any LLM
-sentinel context ./my-project
+claude mcp add --scope user sentinel -- npx tsx /path/to/sentinel/server.ts
 ```
 
-Every run writes a `sentinel-report.md` to the project root — open it to see full triage details and raw test output.
+> **Note:** `--scope local` (the default) registers the server under the current directory and only activates when Claude Code is opened in that exact path. Since Sentinel tests any project, `--scope user` is required.
 
-```bash
-# CI pipeline (JSON output, exit code 0 = pass, 1 = fail)
-sentinel run ./my-project --json
+#### Cursor
 
-# Override scope, custom test dir, save tests back to project
-sentinel run ./my-project --scope full --tests ./my-tests --save --timeout 600000
+**Global** (works in all workspaces) — add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "sentinel": {
+      "command": "npx",
+      "args": ["tsx", "/path/to/sentinel/server.ts"]
+    }
+  }
+}
 ```
+
+**Per-project** (works only in that project) — add to `.cursor/mcp.json` at your project root. Unlike Claude Code, Cursor does not restrict by exact path; any workspace that contains the file will load the server.
+
+#### Windsurf
+
+Add to `~/.codeium/windsurf/mcp_config.json` (global — Windsurf has no project-level MCP scoping):
+
+```json
+{
+  "mcpServers": {
+    "sentinel": {
+      "command": "npx",
+      "args": ["tsx", "/path/to/sentinel/server.ts"]
+    }
+  }
+}
+```
+
+#### VS Code Copilot
+
+**Global** (works in all workspaces) — open the Command Palette → "MCP: Open User Configuration" and add:
+
+```json
+{
+  "servers": {
+    "sentinel": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["tsx", "/path/to/sentinel/server.ts"]
+    }
+  }
+}
+```
+
+**Per-workspace** — add to `.vscode/mcp.json` at your project root. Unlike Claude Code, VS Code does not restrict by exact path; any workspace containing the file will load the server.
+
 
 | Command | What it does |
 |---------|-------------|
@@ -137,21 +174,17 @@ console.log(report.summary);
 destroyWorkspace(ws);
 ```
 
-### With any AI agent
-
-Run `sentinel context ./my-project` to get plain text prompts (PM, Tester, Hacker). Feed them to any LLM — Claude, GPT, Gemini, local models — save the generated tests to `__sentinel__/`, then `sentinel run` to execute. The island algorithm works with any model.
-
 ## Pipeline
 
 ```
-CLI                                      OpenClaw plugin
-───                                      ──────────────
-sentinel scan        ←→                  sentinel_scan
-                                         sentinel_config
-sentinel context     ←→                  sentinel_pm → sentinel_test → sentinel_hack
-sentinel run         ←→                  sentinel_run
-       ↓
-sentinel-report.md                       (inline report)
+MCP server                    OpenClaw plugin
+──────────                    ──────────────
+sentinel_scan           ←→    sentinel_scan
+sentinel_config                sentinel_config
+sentinel_pm → test → hack ←→  sentinel_pm → test → hack
+sentinel_run            ←→    sentinel_run
+      ↓                              ↓
+(inline report)               (inline report)
 ```
 
 ## Demo
@@ -171,7 +204,7 @@ Tested on [memgraph-plugin](https://github.com/lilyhuang-github/memgraph-plugin)
 ## Architecture
 
 ```
-bin/sentinel.ts       — CLI entry point (scan, run, context commands, report generation)
+server.ts             — MCP server (Claude Code, Cursor, Windsurf, VS Code Copilot)
 index.ts              — OpenClaw plugin (tool registration, prompts, island algorithm)
 lib/detect.ts         — Language detection, git scope, API surface extraction (9 languages)
 lib/runners.ts        — Per-language runner config table (install, test, cache isolation)

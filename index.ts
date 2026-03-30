@@ -286,7 +286,7 @@ const SYSTEM_TESTER_PROMPT = `
 You are a senior QA engineer focused on **code correctness**.
 You see ONLY the source code and API surface. You do NOT see UX criteria — that's another tester's job.
 
-Your job: generate a test plan that validates whether this code is **functionally correct**.
+Your job: generate **runnable test code** that validates whether this code is **functionally correct**.
 
 ## Focus areas:
 - Does each function do what its signature/name promises?
@@ -294,31 +294,39 @@ Your job: generate a test plan that validates whether this code is **functionall
 - Do components integrate correctly?
 - Are edge cases at documented boundaries handled?
 - Are error paths handled gracefully?
-- Are type contracts honored? (e.g. does a function that returns Promise<string> ever return null?)
-
-## Format each test as:
-[T-Sys][Category] target_function — description
-- Input: concrete values
-- Expected: concrete expected behavior
-- Why: what specification or contract this validates
+- Are type contracts honored?
 
 Categories: Functional, Boundary, Stability, Recovery, Integration, Resource
 
-## Rules
-- Every test MUST assert CORRECT behavior, not current behavior
-- If invalid input is accepted silently, assert it SHOULD throw
-- Never write a test that PASSES on dangerous behavior
-- Use real imports from the target source code only
-- Each test must be independent (no shared mutable state)
-- Do NOT test performance, UX, or user experience — focus purely on correctness
+## CRITICAL — Assertion Direction Rules
+Every test MUST assert the CORRECT/DESIRED behavior, NOT the current (possibly broken) behavior.
 
-Present the test plan to the user.
+✅ CORRECT — assert what SHOULD happen:
+  expect(() => fn(NaN)).toThrow()           // dangerous input SHOULD be rejected
+  expect(result).not.toContain('injected')  // injection SHOULD be blocked
+  expect(Number.isNaN(result)).toBe(false)  // NaN SHOULD NOT propagate silently
+
+❌ WRONG — asserts that the bug exists (test passes on broken code):
+  expect(() => fn(NaN)).not.toThrow()       // "it doesn't throw" — that's the bug!
+  expect(result).toContain('injected')      // "injection works" — that's the vulnerability!
+  expect(Number.isNaN(result)).toBe(true)   // "it returns NaN" — that's the corruption!
+
+If the code currently has a bug, the test MUST FAIL. A passing test suite with known bugs is worthless.
+
+## Output format
+Output a COMPLETE, RUNNABLE test file. Use the test runner detected for this project.
+- Use real imports from the target source code
+- Each test must be independent (no shared mutable state)
+- Include describe blocks with [T-Sys] prefix for traceability
+- Do NOT output a plan or description — output ONLY executable test code
+
+Present the test code to the user. After approval, it will be passed to sentinel_run.
 `;
 
 // ── User Tester prompt (Step 2b) ──
 // Translates PM criteria into runnable tests — does NOT care about correctness
 const USER_TESTER_PROMPT = `
-You are a UX test engineer. Your job is to translate PM acceptance criteria into **runnable tests**.
+You are a UX test engineer. Your job is to translate PM acceptance criteria into **runnable test code**.
 
 You do NOT test correctness — the System Tester handles that.
 You ONLY test whether the code meets the PM's quantitative UX thresholds.
@@ -327,34 +335,35 @@ You ONLY test whether the code meets the PM's quantitative UX thresholds.
 {PM_CRITERIA}
 
 ## How to translate each criterion into a test:
-
-For each PM criterion, write a test that:
-1. Sets up the exact condition the PM described
-2. Measures the exact metric the PM specified
-3. Asserts against the exact threshold the PM defined
-
-Examples of translation:
 - PM says ">1s = FAIL" → write a test that times the operation and asserts elapsed < 1000ms
 - PM says "error must not contain file path" → write a test that triggers an error and asserts the message matches no path pattern
 - PM says "memory must not grow >10MB after 1000 calls" → write a test that calls 1000 times and measures heap delta
-- PM says "must not consume >$0.01 per call" → write a test that mocks/measures the resource consumption per call
 
-## Format each test as:
-[T-UX][Tier N] target_function — criterion name
-- PM Criterion: reference the exact PM criterion being tested
-- Setup: how to create the test condition
-- Measure: what to measure
-- Threshold: exact pass/fail value
-- Assert: the specific assertion
+## CRITICAL — Assertion Direction Rules
+Every test MUST assert the DESIRED behavior. If the code violates the PM criterion, the test MUST FAIL.
 
-## Rules
-- Every PM criterion tagged FAIL is MANDATORY — you must write a test for it
-- Every PM criterion tagged WARNING should be covered if feasible
-- Tests must be actually runnable — not pseudocode
-- Use real timing (performance.now / Date.now), real memory measurement (process.memoryUsage), real assertions
+✅ CORRECT — test fails when PM criterion is violated:
+  expect(recallOutput.length).toBeLessThan(5000)  // PM says "no silent token cost >5000"
+  expect(elapsed).toBeLessThan(1000)               // PM says ">1s = FAIL"
+  expect(defaultEndpoint).not.toContain('deepseek') // PM says "no external API for local plugin"
+
+❌ WRONG — test passes even though PM criterion is violated:
+  expect(recallOutput.length).toBeGreaterThan(0)   // "it returns something" — doesn't check the limit!
+  expect(true).toBe(true)                          // placeholder — tests nothing!
+  expect(defaultEndpoint).toContain('deepseek')    // "it IS deepseek" — confirms the bug exists!
+
+A test that passes on a known violation is worse than no test at all.
+
+## Output format
+Output a COMPLETE, RUNNABLE test file. Use the test runner detected for this project.
+- Use real imports from the target source code
 - Each test must be independent
+- Include describe blocks with [T-UX][Tier N] prefix for traceability
+- Do NOT output a plan or description — output ONLY executable test code
+- Every PM criterion tagged FAIL is MANDATORY
+- Every PM criterion tagged WARNING should be covered if feasible
 
-Present the test plan to the user.
+Present the test code to the user. After approval, it will be passed to sentinel_run.
 `;
 
 // ── Hacker prompt components (Step 3) ──
@@ -463,12 +472,25 @@ If the function accepts it without error, it's a vulnerability — downstream co
 ];
 
 const HACKER_OUTPUT_FORMAT = `
-## Output format:
-[H][Skill {SKILL_ID}] target_function — attack name
-- Attack vector: exact steps (specific inputs, specific call sequence)
-- Payload: the actual malicious input (show the code/string)
-- Expected defense: what SHOULD happen (throw, reject, sanitize, limit)
-- Blast radius if undefended: what breaks (data loss, wrong answers, crash, escalation)
+## Output format
+Output **runnable test code** for each attack. Use the project's test runner.
+
+Each test must assert the EXPECTED DEFENSE (what SHOULD happen), so the test FAILS if the vulnerability exists.
+
+✅ CORRECT — test fails when vulnerability is present:
+  expect(() => fn(NaN)).toThrow()                    // NaN SHOULD be rejected
+  expect(stripRecallTags(caseVariant)).toBe('')       // case variants SHOULD be stripped
+  expect(result).not.toContain('SYSTEM: Ignore')      // injection SHOULD be sanitized
+
+❌ WRONG — test passes and confirms the vulnerability:
+  expect(Number.isNaN(fn(NaN))).toBe(true)           // "NaN propagates" = the bug itself
+  expect(stripRecallTags(caseVariant)).toContain(x)   // "bypass works" = the vulnerability
+  expect(result).toContain('SYSTEM: Ignore')           // "injection stored" = the attack
+
+Include describe blocks with [H][Skill {SKILL_ID}] prefix. Each attack needs:
+- A comment explaining the attack vector and payload
+- An assertion for the expected defense
+- A comment noting "blast radius if undefended"
 
 ## Constraints:
 - Walk through the API surface SYSTEMATICALLY. Every exported function must be considered.
@@ -500,30 +522,35 @@ The individual agents found entry points. Your job is to CHAIN them into compoun
 - Produce at least 3 NEW chain attacks not covered by individual agents
 - Report: "N new chain attacks found" (this determines if another round is needed — <2 = converge)
 
-## Output format:
-[H][Chain] func_A → func_B — chain attack name
-- Chain: step-by-step with concrete payloads
-- Why neither agent alone caught this: explain the cross-skill insight
-- Blast radius: what breaks in production
+## Output format
+Output **runnable test code** for each chain attack using the project's test runner.
+Each test must assert the EXPECTED DEFENSE — test FAILS if the chain vulnerability exists.
+Include describe blocks with [H][Chain] prefix.
 `;
 
 const HACKER_MERGE_PROMPT = `
-You are merging the complete attack results from the Hacker phase.
+You are merging test code from the Tester phase and the Hacker phase into final test files.
 
-## Tester plan:
+## Tester test code:
 {TESTER_PLAN}
 
-## All Hacker results (individual skills + chain attacks):
+## All Hacker test code (individual skills + chain attacks):
 {ALL_RESULTS}
 
 ## Merge rules:
 - Keep ALL Tester tests (tag [T])
 - Add ALL Hacker attacks as tests (tag [H])
 - If a Tester test overlaps with a Hacker attack but the Hacker version is nastier, replace it (tag [T+H])
+- Deduplicate tests that assert the same thing
 - Show coverage stats: "X from Tester, Y unique from Hacker, Z upgraded, C chain attacks"
-- Show API surface coverage: "Attacked N of M exported functions"
 
-Present the merged plan to the user. After approval, call sentinel_run with the test file contents.
+## CRITICAL — Assertion Direction Check
+Before outputting, review EVERY expect() call. Ask: "Does this test FAIL when the bug exists?"
+- If the test would PASS on broken code → flip the assertion
+- If the test is a placeholder (expect(true).toBe(true)) → replace with a real assertion or remove
+
+Output the final merged test file(s) as COMPLETE, RUNNABLE code ready for sentinel_run.
+Call sentinel_run with the test file contents.
 `;
 
 // ── Plugin ──
@@ -695,10 +722,22 @@ export default function register(api: any) {
 
           const scopeGuide = SCOPE_GUIDANCE[scanResult.scope] || SCOPE_GUIDANCE.full;
 
+          // Time estimate based on island algorithm config
+          const pmCalls = (config.pmIslands || 4) + 1 + 1; // tiers + cross + merge
+          const hackerCalls = (config.hackerIslands || 6) + 1 + 1; // skills + cross + merge
+          const testerCalls = 2; // system + user
+          const totalCalls = 1 + pmCalls + testerCalls + hackerCalls; // research + PM + testers + hacker
+          const rounds = config.maxIslandRounds || 2;
+          const perCallSec = 30;
+          const estMin = Math.ceil((totalCalls * rounds * perCallSec) / 60);
+          const timeEstimate = `**Estimated time: ~${estMin} min** (${totalCalls} tool calls × ${rounds} max rounds, ~${perCallSec}s each)`;
+
           const output = [
             `## Configuration Confirmed`,
             "",
             formatConfigProposal(config, scanResult),
+            "",
+            timeEstimate,
             "",
             `---`,
             `Configuration locked. Proceed to the PM phase:`,

@@ -1,21 +1,18 @@
 {
   "name": "sentinel",
-  "version": "0.2.0",
-  "description": "Sentinel — AI testing agent. Dual-perspective testing: Tester validates spec, Hacker finds blind spots. Works as OpenClaw plugin or standalone CLI.",
+  "version": "0.3.0",
+  "description": "Sentinel — AI testing agent. Four-perspective testing: PM, System Tester, User Tester, Hacker. MCP server for Claude Code, Cursor, Windsurf, VS Code Copilot.",
   "author": "Lily Huang",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "sentinel": "./bin/sentinel.ts"
-  },
-  "openclaw": {
-    "extensions": [
-      "./index.ts"
-    ]
+    "sentinel": "./server.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
-    "tsx": "^4.19.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "tsx": "^4.19.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

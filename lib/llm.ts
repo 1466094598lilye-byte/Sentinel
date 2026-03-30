@@ -25,6 +25,15 @@ interface ProviderInfo {
 // Session cache — once we have a key (from any source), keep it
 let cachedProvider: ProviderInfo | null = null;
 
+/** Write key back to process.env so SDKs (Anthropic, OpenAI) can find it */
+function syncToProcessEnv(info: ProviderInfo): void {
+  if (info.provider === "anthropic") {
+    process.env.ANTHROPIC_API_KEY = info.key;
+  } else {
+    process.env.OPENAI_API_KEY = info.key;
+  }
+}
+
 /**
  * Try to extract a key from a .env file.
  * Handles KEY=value and KEY="value" formats.
@@ -114,6 +123,7 @@ export function detectProvider(): ProviderInfo | null {
   const found = findKeyFromEnv();
   if (found) {
     cachedProvider = found;
+    syncToProcessEnv(found);
   }
   return found;
 }
@@ -128,6 +138,7 @@ export async function requireProvider(): Promise<ProviderInfo> {
   const found = findKeyFromEnv();
   if (found) {
     cachedProvider = found;
+    syncToProcessEnv(found);
     return found;
   }
 
@@ -147,9 +158,9 @@ export async function requireProvider(): Promise<ProviderInfo> {
 
 let anthropicClient: Anthropic | null = null;
 
-function getAnthropic(): Anthropic {
+function getAnthropic(apiKey: string): Anthropic {
   if (!anthropicClient) {
-    anthropicClient = new Anthropic();
+    anthropicClient = new Anthropic({ apiKey });
   }
   return anthropicClient;
 }
@@ -162,54 +173,84 @@ export interface LLMOptions {
   model?: string;
 }
 
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 5_000;
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Call the LLM and return the text response.
  * Automatically resolves API key on first call.
+ * Retries up to 3 times on transient errors (overloaded, connection).
  */
 export async function llm(prompt: string, opts: LLMOptions = {}): Promise<string> {
   const { provider, key } = await requireProvider();
   const maxTokens = opts.maxTokens || 4096;
 
-  if (provider === "anthropic") {
-    const model = opts.model || "claude-sonnet-4-20250514";
-    const client = getAnthropic();
-    const msg = await client.messages.create({
-      model,
-      max_tokens: maxTokens,
-      ...(opts.system ? { system: opts.system } : {}),
-      messages: [{ role: "user", content: prompt }],
-    });
-    return msg.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("");
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      if (provider === "anthropic") {
+        const model = opts.model || "claude-sonnet-4-20250514";
+        const client = getAnthropic(key);
+        const msg = await client.messages.create({
+          model,
+          max_tokens: maxTokens,
+          ...(opts.system ? { system: opts.system } : {}),
+          messages: [{ role: "user", content: prompt }],
+        });
+        return msg.content
+          .filter((b): b is Anthropic.TextBlock => b.type === "text")
+          .map((b) => b.text)
+          .join("");
+      }
+
+      // OpenAI fallback — raw fetch
+      const model = opts.model || "gpt-4o";
+      const body: any = {
+        model,
+        max_tokens: maxTokens,
+        messages: [
+          ...(opts.system ? [{ role: "system", content: opts.system }] : []),
+          { role: "user", content: prompt },
+        ],
+      };
+
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${key}`,
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        const status = res.status;
+        // Retry on 429 (rate limit) and 529 (overloaded)
+        if ((status === 429 || status === 529) && attempt < MAX_RETRIES) {
+          console.error(`[sentinel] API ${status}, retrying in ${RETRY_DELAY_MS / 1000}s (attempt ${attempt}/${MAX_RETRIES})...`);
+          await sleep(RETRY_DELAY_MS * attempt);
+          continue;
+        }
+        throw new Error(`OpenAI API error ${status}: ${text.slice(0, 500)}`);
+      }
+
+      const json = await res.json();
+      return json.choices?.[0]?.message?.content || "";
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      const isTransient = /overloaded|connection|ECONNRESET|ETIMEDOUT|529|rate/i.test(msg);
+      if (isTransient && attempt < MAX_RETRIES) {
+        console.error(`[sentinel] ${msg}, retrying in ${RETRY_DELAY_MS / 1000}s (attempt ${attempt}/${MAX_RETRIES})...`);
+        await sleep(RETRY_DELAY_MS * attempt);
+        continue;
+      }
+      throw err;
+    }
   }
 
-  // OpenAI fallback — raw fetch
-  const model = opts.model || "gpt-4o";
-  const body: any = {
-    model,
-    max_tokens: maxTokens,
-    messages: [
-      ...(opts.system ? [{ role: "system", content: opts.system }] : []),
-      { role: "user", content: prompt },
-    ],
-  };
-
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${key}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`OpenAI API error ${res.status}: ${text.slice(0, 500)}`);
-  }
-
-  const json = await res.json();
-  return json.choices?.[0]?.message?.content || "";
+  throw new Error("LLM call failed after max retries");
 }

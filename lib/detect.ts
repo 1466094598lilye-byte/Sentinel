@@ -14,6 +14,7 @@ export interface ScanResult {
   scope: "commit" | "branch" | "changes" | "full";
   changedFiles: string[];
   sourceFiles: string[];
+  sourceContents: Record<string, string>;
   apiSurface: ExportEntry[];
   dependencies: Record<string, string>;
   existingTests: string[];
@@ -711,11 +712,22 @@ export function scan(targetDir: string, explicitScope?: string): ScanResult {
   const apiSurface = extractApiSurface(targetDir, sourceFiles, language);
   const dependencies = readDependencies(targetDir, language);
 
+  // Read all source file contents
+  const sourceContents: Record<string, string> = {};
+  for (const file of sourceFiles) {
+    try {
+      sourceContents[file] = readFileSync(join(targetDir, file), "utf-8");
+    } catch {
+      // skip unreadable
+    }
+  }
+
   return {
     language,
     scope,
     changedFiles,
     sourceFiles,
+    sourceContents,
     apiSurface,
     dependencies,
     existingTests,

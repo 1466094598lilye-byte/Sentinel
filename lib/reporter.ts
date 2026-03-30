@@ -160,6 +160,7 @@ export function formatScanContextShuffled(scan: ScanResult, seed: number): strin
 }
 
 /** Format scan result as context for the agent to generate test plans */
+/** Format scan context for LLM prompts — includes full source code. */
 export function formatScanContext(scan: ScanResult): string {
   const lines: string[] = [];
 
@@ -206,6 +207,19 @@ export function formatScanContext(scan: ScanResult): string {
     }
     lines.push("```");
     lines.push("");
+  }
+
+  // Source code — LLM needs to see actual code to write correct tests
+  const sourceEntries = Object.entries(scan.sourceContents || {});
+  if (sourceEntries.length > 0) {
+    lines.push(`## Source Code`);
+    for (const [file, content] of sourceEntries) {
+      lines.push(`### ${file}`);
+      lines.push("```");
+      lines.push(content);
+      lines.push("```");
+      lines.push("");
+    }
   }
 
   const depEntries = Object.entries(scan.dependencies);
