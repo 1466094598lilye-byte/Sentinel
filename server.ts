@@ -31,6 +31,7 @@ import type { Workspace } from "./lib/workspace.js";
 // ── State ──
 const activeWorkspaces = new Map<string, Workspace>();
 const lastScanResults = new Map<string, ScanResult>();
+const pendingScan = new Map<string, { result: ScanResult; scope?: string }>();
 const lastIntent = new Map<string, string>();
 const lastCalibration = new Map<string, string>();
 const lastPMCriteria = new Map<string, string>();
@@ -563,28 +564,43 @@ server.tool(
   },
   async ({ target, scope, intent }) => {
     const result = scan(target, scope);
-    lastScanResults.set(SESSION, result);
 
-    if (intent) lastIntent.set(SESSION, intent);
+    // ── Gate: no intent → block pipeline, force calibration ──
+    if (!intent) {
+      // Store scan internally but do NOT expose results to host LLM
+      pendingScan.set(SESSION, { result, scope });
+      return text([
+        `# Calibration Required`,
+        "",
+        `Sentinel scanned **${result.language}** project (${result.apiSurface.length} exports, ${result.sourceFiles.length} files).`,
+        "",
+        `Before I can proceed, I need to understand your intent.`,
+        "",
+        `**Ask the user:** "What is this project for, and why are you testing it?"`,
+        "",
+        `Then call sentinel_scan again with the same target and \`intent\` set to the user's answer.`,
+        "",
+        `⛔ sentinel_pm, sentinel_test, sentinel_hack, and sentinel_run will not work until calibration is complete.`,
+      ].join("\n"));
+    }
+
+    // ── Calibrated path: store results and proceed ──
+    lastScanResults.set(SESSION, result);
+    lastIntent.set(SESSION, intent);
+    pendingScan.delete(SESSION);
 
     const context = formatScanContext(result);
     const proposed = proposeConfig(result);
     const parts = [context, "", formatConfigProposal(proposed, result)];
 
-    if (!intent) {
-      parts.push("", "---", "## Calibration Required");
-      parts.push('Before proceeding to PM, ask the user ONE question: **"What is this project for?"**');
-      parts.push("Then call sentinel_scan again with `intent` to run calibration.");
-    } else {
-      parts.push("", `## Project Intent`, `> ${intent}`);
-      if (detectProvider()) {
-        try {
-          const cal = await calibrate(intent, result);
-          lastCalibration.set(SESSION, cal.expectedCapabilities);
-          parts.push("", "## Intent Calibration (LLM analysis)", cal.expectedCapabilities);
-        } catch (err: any) {
-          parts.push("", `(Calibration failed: ${err?.message} — proceeding without intent-gap detection)`);
-        }
+    parts.push("", `## Project Intent`, `> ${intent}`);
+    if (detectProvider()) {
+      try {
+        const cal = await calibrate(intent, result);
+        lastCalibration.set(SESSION, cal.expectedCapabilities);
+        parts.push("", "## Intent Calibration (LLM analysis)", cal.expectedCapabilities);
+      } catch (err: any) {
+        parts.push("", `(Calibration failed: ${err?.message} — proceeding without intent-gap detection)`);
       }
     }
 

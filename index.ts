@@ -37,6 +37,7 @@ import type { Workspace } from "./lib/workspace.js";
 // ── State ──
 const activeWorkspaces = new Map<string, Workspace>();
 const lastScanResults = new Map<string, ScanResult>();
+const pendingScan = new Map<string, { result: ScanResult; target: string; scope?: string }>();
 const lastIntent = new Map<string, string>();      // user's one-line project intent
 const lastCalibration = new Map<string, string>(); // LLM-generated capability expectations
 const lastPMCriteria = new Map<string, string>();
@@ -609,55 +610,68 @@ export default function register(api: any) {
 
           const result = scan(params.target, params.scope);
           (result as any)._targetDir = params.target; // store for hook
-          lastScanResults.set(sessionKey, result);
           lastScanDiffHash.set(sessionKey, getGitDiffFingerprint(params.target));
 
-          // Store intent
-          if (params.intent) {
-            lastIntent.set(sessionKey, params.intent);
+          // ── Gate: no intent → block pipeline, force calibration ──
+          if (!params.intent) {
+            pendingScan.set(sessionKey, { result, target: params.target, scope: params.scope });
+            log.info(`[sentinel] Scan complete but intent missing — blocking pipeline for calibration`);
+            return {
+              content: [{
+                type: "text" as const,
+                text: [
+                  `# Calibration Required`,
+                  "",
+                  `Sentinel scanned **${result.language}** project (${result.apiSurface.length} exports, ${result.sourceFiles.length} files).`,
+                  "",
+                  `Before I can proceed, I need to understand your intent.`,
+                  "",
+                  `**Ask the user:** "What is this project for, and why are you testing it?"`,
+                  "",
+                  `Then call sentinel_scan again with the same target and \`intent\` set to the user's answer.`,
+                  "",
+                  `⛔ sentinel_pm, sentinel_test, sentinel_hack, and sentinel_run will not work until calibration is complete.`,
+                ].join("\n"),
+              }],
+            };
           }
+
+          // ── Calibrated path: store results and proceed ──
+          lastScanResults.set(sessionKey, result);
+          lastIntent.set(sessionKey, params.intent);
+          pendingScan.delete(sessionKey);
 
           const context = formatScanContext(result);
           const proposed = proposeConfig(result);
 
           const parts = [context, "", formatConfigProposal(proposed, result)];
 
-          if (!params.intent) {
-            // No intent — nudge agent to ask user
-            parts.push("");
-            parts.push("---");
-            parts.push("## Calibration Required");
-            parts.push('Before proceeding to PM, ask the user ONE question: **"What is this project for?"**');
-            parts.push("Then call sentinel_scan again with `intent` to run calibration.");
-          } else {
-            // Intent provided — run LLM calibration if API key available
-            parts.push("");
-            parts.push(`## Project Intent`);
-            parts.push(`> ${params.intent}`);
+          parts.push("");
+          parts.push(`## Project Intent`);
+          parts.push(`> ${params.intent}`);
 
-            if (detectProvider()) {
-              log.info(`[sentinel] Running intent calibration...`);
-              try {
-                const cal = await calibrate(params.intent, result);
-                lastCalibration.set(sessionKey, cal.expectedCapabilities);
-                parts.push("");
-                parts.push("## Intent Calibration (LLM analysis)");
-                parts.push(cal.expectedCapabilities);
-              } catch (err: any) {
-                log.warn(`[sentinel] Calibration failed: ${err?.message}`);
-                parts.push("");
-                parts.push(`(Calibration failed: ${err?.message} — proceeding without intent-gap detection)`);
-              }
-            } else {
+          if (detectProvider()) {
+            log.info(`[sentinel] Running intent calibration...`);
+            try {
+              const cal = await calibrate(params.intent, result);
+              lastCalibration.set(sessionKey, cal.expectedCapabilities);
               parts.push("");
-              parts.push("(No LLM API key found — set ANTHROPIC_API_KEY or OPENAI_API_KEY for intent-gap detection)");
+              parts.push("## Intent Calibration (LLM analysis)");
+              parts.push(cal.expectedCapabilities);
+            } catch (err: any) {
+              log.warn(`[sentinel] Calibration failed: ${err?.message}`);
+              parts.push("");
+              parts.push(`(Calibration failed: ${err?.message} — proceeding without intent-gap detection)`);
             }
+          } else {
+            parts.push("");
+            parts.push("(No LLM API key found — set ANTHROPIC_API_KEY or OPENAI_API_KEY for intent-gap detection)");
           }
 
           const output = parts.join("\n");
 
           log.info(
-            `[sentinel] Scan complete: ${result.language}, scope=${result.scope}, ${result.sourceFiles.length} files, ${result.apiSurface.length} exports, intent=${params.intent ? "yes" : "pending"}`,
+            `[sentinel] Scan complete: ${result.language}, scope=${result.scope}, ${result.sourceFiles.length} files, ${result.apiSurface.length} exports, intent=yes`,
           );
 
           return {
