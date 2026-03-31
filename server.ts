@@ -22,7 +22,6 @@ import { runTests } from "./lib/executor.js";
 import { formatReport, formatScanContext, formatScanContextShuffled, formatFailureContext } from "./lib/reporter.js";
 import { proposeConfig, formatConfigProposal, setConfig, clearConfig } from "./lib/config.js";
 import { syncSemaphores } from "./lib/concurrency.js";
-import { calibrate } from "./lib/calibrate.js";
 import { detectProvider } from "./lib/llm.js";
 import type { SentinelConfig } from "./lib/config.js";
 import type { ScanResult } from "./lib/detect.js";
@@ -33,7 +32,6 @@ const activeWorkspaces = new Map<string, Workspace>();
 const lastScanResults = new Map<string, ScanResult>();
 const pendingScan = new Map<string, { result: ScanResult; scope?: string }>();
 const lastIntent = new Map<string, string>();
-const lastCalibration = new Map<string, string>();
 const lastPMCriteria = new Map<string, string>();
 const lastTesterPlan = new Map<string, string>();
 const hackRound = new Map<string, number>();
@@ -594,15 +592,6 @@ server.tool(
     const parts = [context, "", formatConfigProposal(proposed, result)];
 
     parts.push("", `## Project Intent`, `> ${intent}`);
-    if (detectProvider()) {
-      try {
-        const cal = await calibrate(intent, result);
-        lastCalibration.set(SESSION, cal.expectedCapabilities);
-        parts.push("", "## Intent Calibration (LLM analysis)", cal.expectedCapabilities);
-      } catch (err: any) {
-        parts.push("", `(Calibration failed: ${err?.message} — proceeding without intent-gap detection)`);
-      }
-    }
 
     return text(parts.join("\n"));
   },
@@ -690,11 +679,7 @@ server.tool(
         return text(`# PM Research Stored\n\nCategory risk profile saved. Now call sentinel_pm with tier=1 to begin.`);
       }
       const sourceContext = formatScanContext(scanResult);
-      const calResult = lastCalibration.get(SESSION);
-      const intentBlock = calResult
-        ? `## Intent Calibration\n${calResult}\n`
-        : "";
-      return text([`# PM Market Research Phase`, "", intentBlock, sourceContext, "", PM_RESEARCH_PROMPT].join("\n"));
+      return text([`# PM Market Research Phase`, "", sourceContext, "", PM_RESEARCH_PROMPT].join("\n"));
     }
 
     // Branch 1: Focused tier pass (1-4)
@@ -710,17 +695,13 @@ server.tool(
         .replace("{RESEARCH_CONTEXT}", research);
       const tierSection = `## Analysis focus: Tier ${t.id} — ${t.name}\n${t.prompt}`;
       const outputFmt = PM_OUTPUT_FORMAT.replace("{TIER_ID}", String(t.id));
-      const calResult = lastCalibration.get(SESSION);
-      const intentBlock = calResult
-        ? `## Intent Calibration\nIntent gaps ([GAP] items) are **T1 findings**.\n\n${calResult}\n`
-        : "";
       const nextHint = tier < 4
         ? `\n\n---\nNext: call sentinel_pm with tier=${tier + 1}.`
         : `\n\n---\nAll 4 tiers complete. Call sentinel_pm with tier="cross" and tierResults=<all 4 results concatenated>.`;
 
       return text([
         `# PM Island ${tier}/4 (Round ${round}) — ${t.name}`, "",
-        intentBlock, shuffledContext, "", prompt, "", tierSection, "", outputFmt, nextHint,
+        shuffledContext, "", prompt, "", tierSection, "", outputFmt, nextHint,
       ].join("\n"));
     }
 

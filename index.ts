@@ -28,7 +28,6 @@ import { runTests } from "./lib/executor.js";
 import { formatReport, formatScanContext, formatScanContextShuffled, formatFailureContext } from "./lib/reporter.js";
 import { proposeConfig, formatConfigProposal, getConfig, setConfig, clearConfig } from "./lib/config.js";
 import { syncSemaphores } from "./lib/concurrency.js";
-import { calibrate } from "./lib/calibrate.js";
 import { detectProvider } from "./lib/llm.js";
 import type { SentinelConfig } from "./lib/config.js";
 import type { ScanResult } from "./lib/detect.js";
@@ -39,7 +38,6 @@ const activeWorkspaces = new Map<string, Workspace>();
 const lastScanResults = new Map<string, ScanResult>();
 const pendingScan = new Map<string, { result: ScanResult; target: string; scope?: string }>();
 const lastIntent = new Map<string, string>();      // user's one-line project intent
-const lastCalibration = new Map<string, string>(); // LLM-generated capability expectations
 const lastPMCriteria = new Map<string, string>();
 const lastTesterPlan = new Map<string, string>();
 const hackRound = new Map<string, number>(); // current round per session
@@ -650,23 +648,6 @@ export default function register(api: any) {
           parts.push(`## Project Intent`);
           parts.push(`> ${params.intent}`);
 
-          if (detectProvider()) {
-            log.info(`[sentinel] Running intent calibration...`);
-            try {
-              const cal = await calibrate(params.intent, result);
-              lastCalibration.set(sessionKey, cal.expectedCapabilities);
-              parts.push("");
-              parts.push("## Intent Calibration (LLM analysis)");
-              parts.push(cal.expectedCapabilities);
-            } catch (err: any) {
-              log.warn(`[sentinel] Calibration failed: ${err?.message}`);
-              parts.push("");
-              parts.push(`(Calibration failed: ${err?.message} — proceeding without intent-gap detection)`);
-            }
-          } else {
-            parts.push("");
-            parts.push("(No LLM API key found — set ANTHROPIC_API_KEY or OPENAI_API_KEY for intent-gap detection)");
-          }
 
           const output = parts.join("\n");
 
@@ -854,14 +835,9 @@ export default function register(api: any) {
 
             // Return research prompt for the agent to execute
             const sourceContext = formatScanContext(scanResult);
-            const calResult = lastCalibration.get(sessionKey);
-            const intentBlock = calResult
-              ? `## Intent Calibration\nThe following capability analysis was generated from the user's stated purpose. Use the [GAP] items to guide competitive research — these are things the project SHOULD have but doesn't.\n\n${calResult}\n`
-              : "";
             const output = [
               `# PM Market Research Phase`,
               "",
-              intentBlock,
               sourceContext,
               "",
               PM_RESEARCH_PROMPT,
@@ -889,11 +865,6 @@ export default function register(api: any) {
             const outputFmt = PM_OUTPUT_FORMAT.replace("{TIER_ID}", String(t.id));
 
             // Intent calibration — LLM-analyzed capability expectations
-            const calResult = lastCalibration.get(sessionKey);
-            const intentBlock = calResult
-              ? `## Intent Calibration\nThe following capability analysis was generated from the user's stated purpose. Intent gaps ([GAP] items) are **T1 findings** — the most critical category.\n\n${calResult}\n`
-              : "";
-
             const nextHint = tier < 4
               ? `\n\n---\nNext: call sentinel_pm with tier=${tier + 1} to continue.`
               : `\n\n---\nAll 4 tiers complete. Call sentinel_pm with tier="cross" and tierResults=<all 4 results concatenated>.`;
@@ -901,7 +872,6 @@ export default function register(api: any) {
             const output = [
               `# PM Island ${tier}/4 (Round ${round}) — ${t.name}`,
               "",
-              intentBlock,
               shuffledContext,
               "",
               prompt,

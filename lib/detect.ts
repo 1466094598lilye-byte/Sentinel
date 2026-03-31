@@ -19,6 +19,8 @@ export interface ScanResult {
   dependencies: Record<string, string>;
   existingTests: string[];
   gitDiff: string;
+  skillFiles: string[];
+  skillContents: Record<string, string>;
 }
 
 export interface ExportEntry {
@@ -262,6 +264,33 @@ export function findTestFiles(targetDir: string, language: Language): string[] {
   if (extensions.length === 0) return [];
   const all = walkDir(targetDir, targetDir, extensions);
   return all.filter((f) => isTestFile(f));
+}
+
+export function findSkillFiles(targetDir: string): string[] {
+  const results: string[] = [];
+  function walk(dir: string) {
+    try {
+      for (const entry of readdirSync(dir)) {
+        const fullPath = join(dir, entry);
+        const relPath = relative(targetDir, fullPath);
+        if (IGNORE_DIRS.some((d) => relPath.startsWith(d) || relPath.includes(`/${d}/`))) continue;
+        try {
+          const stat = statSync(fullPath);
+          if (stat.isDirectory()) {
+            walk(fullPath);
+          } else if (entry === "SKILL.md") {
+            results.push(relPath);
+          }
+        } catch {
+          // skip inaccessible
+        }
+      }
+    } catch {
+      // skip inaccessible dirs
+    }
+  }
+  walk(targetDir);
+  return results;
 }
 
 // ── API surface extraction ──
@@ -722,6 +751,17 @@ export function scan(targetDir: string, explicitScope?: string): ScanResult {
     }
   }
 
+  // Discover SKILL.md files (Claude Code skill definitions)
+  const skillFiles = findSkillFiles(targetDir);
+  const skillContents: Record<string, string> = {};
+  for (const file of skillFiles) {
+    try {
+      skillContents[file] = readFileSync(join(targetDir, file), "utf-8");
+    } catch {
+      // skip unreadable
+    }
+  }
+
   return {
     language,
     scope,
@@ -732,5 +772,7 @@ export function scan(targetDir: string, explicitScope?: string): ScanResult {
     dependencies,
     existingTests,
     gitDiff,
+    skillFiles,
+    skillContents,
   };
 }

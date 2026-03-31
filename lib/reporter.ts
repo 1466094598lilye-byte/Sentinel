@@ -209,6 +209,19 @@ export function formatScanContext(scan: ScanResult): string {
     lines.push("");
   }
 
+  // Skill definitions — SKILL.md files contain core logic for skill-driven projects
+  const skillEntries = Object.entries(scan.skillContents || {});
+  if (skillEntries.length > 0) {
+    lines.push(`## Skill Definitions (SKILL.md)`);
+    for (const [file, content] of skillEntries) {
+      lines.push(`### ${file}`);
+      lines.push("```markdown");
+      lines.push(content);
+      lines.push("```");
+      lines.push("");
+    }
+  }
+
   // Source code — LLM needs to see actual code to write correct tests
   const sourceEntries = Object.entries(scan.sourceContents || {});
   if (sourceEntries.length > 0) {
