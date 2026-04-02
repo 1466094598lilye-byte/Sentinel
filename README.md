@@ -1,6 +1,6 @@
 # Sentinel
 
-Four-perspective AI testing agent. Throw any codebase at it — TypeScript, Python, Go, Rust, Java, C#, Swift, Ruby — and it generates + runs tests from four independent viewpoints that catch what single-pass testing misses.
+Host-model-powered four-perspective testing workflow for small-to-mid codebases. Sentinel scans the full current checkout, isolates PM/System/User/Hacker phases with strict artifact boundaries, helps the host coding agent generate runnable tests, and packages host-run failures into a structured T-tier reporting pass.
 
 ## The Problem
 
@@ -17,57 +17,70 @@ Four perspectives, each isolated from the others:
 | **User Tester** | UX Engineer | "Does it meet the PM's thresholds?" — response time >1s = FAIL, error quality, resource waste |
 | **Hacker** | Attacker | "Can I break it?" — data poisoning, silent wrong answers, injection, resource exhaustion |
 
-The PM doesn't know what the Hacker will attack. The Hacker can't see what it generated as the Tester. Each sees the code in a **different randomized order**. This breaks the "same LLM, same blind spots" collapse.
+The PM doesn't know what the Hacker will attack. The Hacker can't see what it generated as the Tester. Sentinel's isolation comes from strict artifact boundaries and phase-specific visibility, not from scrambling the code context.
 
 ## Key Features
 
+### Host-Executed Tests
+Sentinel does not execute tests through MCP or the OpenClaw plugin. The host coding agent writes the generated test files into its own workspace, runs them with its own terminal or sandbox, and passes raw failure evidence back to Sentinel.
+
+### Final T-Tier Report Input
+After the host run finishes, call `sentinel_report` with raw failure items:
+
+- `test_name`
+- `failure_type`
+- `error_message`
+
+Sentinel formats a strict T-tier reporting input so the host model can judge each failure item one at a time from concrete evidence instead of vague summaries.
+
 ### Market Research
-Before writing criteria, the PM **searches GitHub for competing projects**, reads their Issues/PRs, and extracts risks specific to this product category. Testing an LLM memory plugin? The PM finds mem0's token explosion bug (#2066) and checks if your code has the same problem. No generic checklists.
+When the host model has GitHub or web tools available, the PM phase can do market research before writing criteria: compare competing projects, read their Issues/PRs, and surface risks that are specific to this product category instead of falling back to a generic checklist.
 
 ### Island Algorithm
-PM and Hacker phases use isolated sub-agents (inspired by [BugBot](https://cursor.com/bugbot) + [Strix](https://github.com/usestrix/strix)):
+PM and Hacker phases use isolated cabins (inspired by [BugBot](https://cursor.com/bugbot) + [Strix](https://github.com/usestrix/strix)):
 
 ```
-Round 1:  6 sub-agents explore independently, each with randomized code order
+Round 1:  6 focused cabins explore independently, each within its own constrained attack lane
     |
-Cross:    Chain findings across sub-agents ("A found X accepts garbage + B found Y trusts X's output = chain attack")
+Cross:    Chain findings across cabins ("A found X accepts garbage + B found Y trusts X's output = chain attack")
     |
 Round 2:  Dig deeper into the most dangerous chains (narrower focus each round)
     |
 Converge: Stop when < 2 new findings (max 3 rounds)
 ```
 
-### Traffic Light Triage
-Failures auto-classified by severity:
+### Configuration
+Sentinel proposes timeouts, concurrency limits, and island rounds from language, file count, API surface, and machine characteristics. You confirm before the PM/test/hack phases begin.
 
-| Light | Meaning | Triggers |
-|-------|---------|----------|
-| **RED** | Fix now | T1/T2 failures, silent wrong answers, injection vectors, critical competitive risks |
-| **YLW** | Fix soon | T3 failures, state corruption, resource exhaustion |
-| **GRN** | Fix later | T4 failures, warnings |
+### Mainstream Ecosystem Coverage
+Sentinel targets mainstream stacks rather than every niche toolchain:
 
-### Smart Config
-Scan detects your project size, language build speed, machine specs, and environment (local/CI), then proposes timeouts, concurrency limits, and island rounds. You confirm before anything runs.
+- TypeScript / JavaScript: `npm`, `pnpm`, `yarn`, `bun` + vitest
+- Python: `pip`, `poetry`, `pdm`, `uv` + pytest
+- Java: Maven / Gradle, including `mvnw` / `gradlew`
+- Go, Rust, C#, Swift, Ruby: native mainstream test runners
 
 ## Supported Languages
 
-| Language | Detection | Test Runner | API Extraction |
-|----------|-----------|-------------|----------------|
-| TypeScript | `tsconfig.json` | vitest | `export function/class/const` |
-| JavaScript | file extension count | vitest | `export function/class/const` |
-| Python | `pyproject.toml` / `setup.py` | pytest | top-level `def`/`class` |
-| Go | `go.mod` | `go test` | capitalized `func`/`type` |
-| Rust | `Cargo.toml` | `cargo test` | `pub fn`/`struct`/`trait` |
-| Java | `pom.xml` / `build.gradle` | Maven / Gradle | `public class`/`method` |
-| C# | `.csproj` / `.sln` | `dotnet test` (xunit) | `public class`/`method` |
-| Swift | `Package.swift` | `swift test` | `public func`/`class`/`protocol` |
-| Ruby | `Gemfile` | rspec | top-level `class`/`def` |
+| Language | Detection | Mainstream Runner Path | API Extraction |
+|----------|-----------|------------------------|----------------|
+| TypeScript | `tsconfig.json` | vitest via `npm` / `pnpm` / `yarn` / `bun` | regex-based `export function/class/const` |
+| JavaScript | file extension count | vitest via `npm` / `pnpm` / `yarn` / `bun` | regex-based `export function/class/const` |
+| Python | `pyproject.toml` / `setup.py` | pytest via `pip` / `poetry` / `pdm` / `uv` | regex-based top-level `def`/`class` |
+| Go | `go.mod` | `go test` | regex-based capitalized `func`/`type` |
+| Rust | `Cargo.toml` | `cargo test` | regex-based `pub fn`/`struct`/`trait` |
+| Java | `pom.xml` / `build.gradle` | Maven / Gradle, including `mvnw` / `gradlew` | regex-based `public class`/`method` |
+| C# | `.csproj` / `.sln` | `dotnet test` (xunit) | regex-based `public class`/`method` |
+| Swift | `Package.swift` | `swift test` | regex-based `public func`/`class`/`protocol` |
+| Ruby | `Gemfile` | rspec | regex-based top-level `class`/`def` |
 
 ## Usage
 
 ### MCP Server (recommended)
 
-Sentinel works as an MCP server with any compatible AI coding tool. Install once, then use `sentinel_scan` → `sentinel_pm` → `sentinel_test` → `sentinel_hack` → `sentinel_run` from your editor.
+Sentinel works as an MCP server with any compatible AI coding tool. Install once, then use:
+
+`sentinel_scan` → `sentinel_config` → `sentinel_pm` → `sentinel_test` → `sentinel_hack` → host coding agent writes + runs tests → `sentinel_report`
 
 #### Claude Code
 
@@ -87,6 +100,7 @@ claude mcp add --scope user sentinel -- npx tsx /path/to/sentinel/server.ts
 {
   "mcpServers": {
     "sentinel": {
+      "type": "stdio",
       "command": "npx",
       "args": ["tsx", "/path/to/sentinel/server.ts"]
     }
@@ -130,21 +144,6 @@ Add to `~/.codeium/windsurf/mcp_config.json` (global — Windsurf has no project
 **Per-workspace** — add to `.vscode/mcp.json` at your project root. Unlike Claude Code, VS Code does not restrict by exact path; any workspace containing the file will load the server.
 
 
-| Command | What it does |
-|---------|-------------|
-| `sentinel <target>` | Auto: scan, then run if `__sentinel__/` exists |
-| `sentinel scan <target>` | Print project context + proposed config |
-| `sentinel run <target>` | Execute tests, write `sentinel-report.md` |
-| `sentinel context <target>` | Print prompts for manual LLM use |
-
-| Flag | Description |
-|------|-------------|
-| `--scope <commit\|branch\|changes\|full>` | Override auto-detected git scope |
-| `--tests <dir>` | Custom test directory (default: `__sentinel__/`) |
-| `--save` | Copy test files back to project after run |
-| `--json` | JSON output for CI pipelines |
-| `--timeout <ms>` | Test execution timeout (default: 300000) |
-
 ### As an OpenClaw plugin
 
 ```json
@@ -155,37 +154,49 @@ Add to `~/.codeium/windsurf/mcp_config.json` (global — Windsurf has no project
 }
 ```
 
-Then use the tools: `sentinel_scan` → `sentinel_config` → `sentinel_pm` → `sentinel_test` → `sentinel_hack` → `sentinel_run`
+Then use the tools: `sentinel_scan` → `sentinel_config` → `sentinel_pm` → `sentinel_test` → `sentinel_hack`
 
-### As a library
+### As a library (advanced)
 
 ```typescript
 import { scan } from "sentinel/lib/detect";
-import { createWorkspace, installDeps, writeTestFiles, destroyWorkspace } from "sentinel/lib/workspace";
-import { runTests } from "sentinel/lib/executor";
-import { formatReport } from "sentinel/lib/reporter";
+import { formatScanContext, formatTierReportInput } from "sentinel/lib/reporter";
 
-const result = scan("/path/to/project");
-const ws = createWorkspace("/path/to/project", result.language);
-await installDeps(ws);
-writeTestFiles(ws, { "my.test.ts": testCode });
-const report = formatReport(result, await runTests(ws));
-console.log(report.summary);
-destroyWorkspace(ws);
+const scanResult = scan("/path/to/project");
+console.log(formatScanContext(scanResult));
+
+const tierReportInput = formatTierReportInput({
+  failures: [
+    {
+      testName: "should reject invalid session tokens",
+      failureType: "runtime",
+      errorMessage: "Expected 401 but received 500"
+    }
+  ]
+});
+
+console.log(tierReportInput);
 ```
+
+The low-level workspace and executor helpers still exist for advanced embedding, but the MCP server and OpenClaw plugin do not execute tests for you.
 
 ## Pipeline
 
 ```
-MCP server                    OpenClaw plugin
-──────────                    ──────────────
-sentinel_scan           ←→    sentinel_scan
-sentinel_config                sentinel_config
-sentinel_pm → test → hack ←→  sentinel_pm → test → hack
-sentinel_run            ←→    sentinel_run
-      ↓                              ↓
-(inline report)               (inline report)
+MCP server                                OpenClaw plugin
+──────────                                ──────────────
+sentinel_scan                       ←→    sentinel_scan
+sentinel_config                            sentinel_config
+sentinel_pm → test → hack           ←→    sentinel_pm → test → hack
+      ↓                                          ↓
+host coding agent writes + runs tests    host coding agent writes + runs tests
+      ↓                                          ↓
+sentinel_report                     ←→    sentinel_report
+      ↓                                          ↓
+host model produces final T-tier report    host model produces final T-tier report
 ```
+
+Sentinel does not expose a standalone CLI. The supported entry points are the MCP server and the OpenClaw plugin.
 
 ## Demo
 
@@ -199,26 +210,27 @@ Tested on [memgraph-plugin](https://github.com/lilyhuang-github/memgraph-plugin)
 | 2 | `stripRecallTags` nested tags bypass cleanup — injection vector | Research-driven test |
 | 2 | `stripRecallTags` unclosed tags leak content | UX Tester |
 
-53 tests, 5 bugs found and fixed. Round 2 bugs were only caught **after adding market research** — the PM found them by learning from mem0 and Langchain's GitHub Issues.
+53 tests, 5 bugs found and fixed. Round 2 bugs were only caught after host-assisted market research surfaced category-specific failure modes.
 
 ## Architecture
 
 ```
 server.ts             — MCP server (Claude Code, Cursor, Windsurf, VS Code Copilot)
 index.ts              — OpenClaw plugin (tool registration, prompts, island algorithm)
-lib/detect.ts         — Language detection, git scope, API surface extraction (9 languages)
-lib/runners.ts        — Per-language runner config table (install, test, cache isolation)
-lib/config.ts         — Smart config proposal (project size × language × environment)
-lib/workspace.ts      — Isolated workspace (copy, install, bootstrap C#/Swift, cleanup)
-lib/executor.ts       — Test execution + output parsing (vitest/pytest/go/cargo/maven/gradle/dotnet/swift/rspec)
-lib/reporter.ts       — Triage report (RED/YLW/GRN), shuffled context for island diversity
-lib/concurrency.ts    — Semaphore-based concurrency, async exec, configurable limits
+lib/detect.ts         — Language detection, full-repo scan, API surface extraction (9 languages, regex-based)
+lib/runners.ts        — Mainstream runner resolution (`npm/pnpm/yarn/bun`, `pip/poetry/pdm/uv`, Maven/Gradle + wrappers)
+lib/config.ts         — Configuration proposal (project size × language × environment)
+lib/workspace.ts      — Isolated full-copy workspace, safe filtering, safe test-file writes
+lib/executor.ts       — Test execution + deterministic failure extraction
+lib/reporter.ts       — Scan context formatting + final T-tier report input builder
+lib/isolation.ts      — Artifact vault for PM / tester / hacker cabin boundaries
+lib/process_env.ts    — Minimized process environment for installs and test runs
+lib/concurrency.ts    — Semaphore-based concurrency and async exec
 ```
 
 ## Acknowledgments
 
-- Git scope auto-detection (commit/branch/full) inspired by [expect-cli](https://github.com/anthropics/anthropic-cookbook/tree/main/misc/expect-cli)
-- Island algorithm combines ideas from [BugBot](https://cursor.com/bugbot) (randomized parallel passes) and [Strix](https://github.com/usestrix/strix) (single-skill focused sub-agents), applied through an island model evolutionary framework
+- Island algorithm combines parallel passes with strict artifact isolation and single-skill focused sub-agents
 - Hacker methodology informed by [Shannon](https://github.com/KeygraphHQ/shannon) (white-box CPG approach) and [PentAGI](https://github.com/vxcontrol/pentagi) (multi-agent + knowledge graph)
 
 ## License

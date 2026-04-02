@@ -3,13 +3,14 @@
  * Creates isolated copy of target, installs test runner, cleans up.
  */
 
-import { mkdtempSync, cpSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, readdirSync } from "fs";
-import { join } from "path";
+import { mkdtempSync, cpSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, readdirSync, statSync } from "fs";
+import { dirname, join, relative, resolve, sep } from "path";
 import { tmpdir } from "os";
 import type { Language } from "./detect.js";
 import { checkEnv } from "./runners.js";
 import { execAsync, installSemaphore, syncSemaphores } from "./concurrency.js";
 import { getConfig } from "./config.js";
+import { buildIsolatedEnv } from "./process_env.js";
 
 export interface Workspace {
   dir: string;
@@ -20,6 +21,40 @@ export interface Workspace {
 // Dirs that should always be skipped regardless of language
 const ALWAYS_IGNORE = [".git", ".git/"];
 
+function normalizeRelativePath(relPath: string): string {
+  return relPath.split(sep).join("/").replace(/^\.\/+/, "").replace(/^\/+/, "");
+}
+
+function matchesIgnoreSpec(relPath: string, spec: string): boolean {
+  const normalizedPath = normalizeRelativePath(relPath);
+  const normalizedSpec = normalizeRelativePath(spec).replace(/\/+$/, "");
+
+  if (!normalizedPath || normalizedPath === ".") return false;
+  if (!normalizedSpec) return false;
+
+  const pathParts = normalizedPath.split("/").filter(Boolean);
+
+  // Support patterns like "*.egg-info"
+  if (normalizedSpec.startsWith("*.")) {
+    const suffix = normalizedSpec.slice(1);
+    return pathParts.some((part) => part.endsWith(suffix));
+  }
+
+  // Support nested specs like "vendor/bundle"
+  if (normalizedSpec.includes("/")) {
+    return normalizedPath === normalizedSpec || normalizedPath.startsWith(`${normalizedSpec}/`);
+  }
+
+  // Exact directory/file segment matches only
+  return pathParts.includes(normalizedSpec);
+}
+
+function shouldIgnoreCopyPath(targetDir: string, src: string, ignoreSpecs: string[]): boolean {
+  const relPath = normalizeRelativePath(relative(targetDir, src));
+  if (!relPath) return false;
+  return ignoreSpecs.some((spec) => matchesIgnoreSpec(relPath, spec));
+}
+
 /** Resolve cache env vars — replace {wsDir} placeholders with actual workspace dir */
 function resolveCacheEnv(cacheEnv: Record<string, string> | undefined, wsDir: string): Record<string, string | undefined> {
   if (!cacheEnv) return {};
@@ -28,6 +63,42 @@ function resolveCacheEnv(cacheEnv: Record<string, string> | undefined, wsDir: st
     resolved[key] = val.replace(/\{wsDir\}/g, wsDir);
   }
   return resolved;
+}
+
+/** Resolve a user-provided relative path inside a base directory, rejecting traversal/absolute escapes. */
+function resolvePathWithin(baseDir: string, unsafePath: string): string {
+  const trimmed = unsafePath.trim();
+  if (!trimmed) {
+    throw new Error("Test filename cannot be empty.");
+  }
+
+  const resolvedPath = resolve(baseDir, trimmed);
+  const rel = relative(baseDir, resolvedPath);
+
+  if (rel === "" || rel === ".") {
+    throw new Error(`Test filename must point to a file, got "${unsafePath}".`);
+  }
+
+  if (rel === ".." || rel.startsWith(`..${sep}`)) {
+    throw new Error(`Refusing to write outside the test directory: "${unsafePath}"`);
+  }
+
+  return resolvedPath;
+}
+
+function listFilesRecursive(dir: string, baseDir: string): string[] {
+  const results: string[] = [];
+  for (const entry of readdirSync(dir)) {
+    const fullPath = join(dir, entry);
+    const relPath = relative(baseDir, fullPath);
+    const stat = statSync(fullPath);
+    if (stat.isDirectory()) {
+      results.push(...listFilesRecursive(fullPath, baseDir));
+    } else if (stat.isFile()) {
+      results.push(relPath);
+    }
+  }
+  return results;
 }
 
 /** Create a temporary workspace with a copy of the target project */
@@ -40,8 +111,7 @@ export function createWorkspace(targetDir: string, language: Language): Workspac
   cpSync(targetDir, dir, {
     recursive: true,
     filter: (src: string) => {
-      const rel = src.replace(targetDir, "");
-      return !skipDirs.some((d) => rel.includes(d));
+      return !shouldIgnoreCopyPath(targetDir, src, skipDirs);
     },
   });
 
@@ -72,6 +142,7 @@ export async function installDeps(ws: Workspace): Promise<{ success: boolean; ou
 
   const { runner } = env;
   const cacheEnv = resolveCacheEnv(runner.cacheEnv, ws.dir);
+  const isolatedEnv = buildIsolatedEnv(ws.dir, cacheEnv);
 
   syncSemaphores();
   const cfg = getConfig();
@@ -90,23 +161,23 @@ export async function installDeps(ws: Workspace): Promise<{ success: boolean; ou
         const hasRequirements = existsSync(join(ws.dir, "requirements.txt"));
 
         if (hasPackage) {
-          const r = await execAsync(`${runner.installCmd} 2>&1`, { cwd: ws.dir, timeout: installTimeout, env: cacheEnv });
+          const r = await execAsync(`${runner.installCmd} 2>&1`, { cwd: ws.dir, timeout: installTimeout, env: isolatedEnv, inheritEnv: false });
           output += r.stdout;
           if (r.exitCode !== 0) return { success: false, output };
         } else if (hasRequirements) {
-          const r = await execAsync("pip install -r requirements.txt 2>&1", { cwd: ws.dir, timeout: installTimeout, env: cacheEnv });
+          const r = await execAsync("pip install -r requirements.txt 2>&1", { cwd: ws.dir, timeout: installTimeout, env: isolatedEnv, inheritEnv: false });
           output += r.stdout;
           if (r.exitCode !== 0) return { success: false, output };
         }
       } else {
-        const r = await execAsync(`${runner.installCmd} 2>&1`, { cwd: ws.dir, timeout: installTimeout, env: cacheEnv });
+        const r = await execAsync(`${runner.installCmd} 2>&1`, { cwd: ws.dir, timeout: installTimeout, env: isolatedEnv, inheritEnv: false });
         output += r.stdout;
         if (r.exitCode !== 0) return { success: false, output };
       }
 
       // Install test runner if not built-in
       if (!runner.builtinTestRunner && runner.testRunnerInstallCmd) {
-        const r = await execAsync(`${runner.testRunnerInstallCmd} 2>&1`, { cwd: ws.dir, timeout: runnerInstallTimeout, env: cacheEnv });
+        const r = await execAsync(`${runner.testRunnerInstallCmd} 2>&1`, { cwd: ws.dir, timeout: runnerInstallTimeout, env: isolatedEnv, inheritEnv: false });
         output += r.stdout;
         if (r.exitCode !== 0) return { success: false, output };
       }
@@ -122,7 +193,8 @@ export async function installDeps(ws: Workspace): Promise<{ success: boolean; ou
 export function writeTestFiles(ws: Workspace, files: Record<string, string>): string[] {
   const written: string[] = [];
   for (const [filename, content] of Object.entries(files)) {
-    const filePath = join(ws.testDir, filename);
+    const filePath = resolvePathWithin(ws.testDir, filename);
+    mkdirSync(dirname(filePath), { recursive: true });
     writeFileSync(filePath, content, "utf-8");
     written.push(filePath);
   }
@@ -146,7 +218,15 @@ export function saveTestFiles(ws: Workspace, targetDir: string): string {
   if (!existsSync(destDir)) {
     mkdirSync(destDir, { recursive: true });
   }
-  cpSync(ws.testDir, destDir, { recursive: true });
+
+  for (const relPath of listFilesRecursive(ws.testDir, ws.testDir)) {
+    const sourcePath = resolvePathWithin(ws.testDir, relPath);
+    const destPath = resolvePathWithin(destDir, relPath);
+    mkdirSync(dirname(destPath), { recursive: true });
+    const content = readFileSync(sourcePath);
+    writeFileSync(destPath, content);
+  }
+
   return destDir;
 }
 

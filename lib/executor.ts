@@ -10,6 +10,7 @@ import { checkEnv } from "./runners.js";
 import type { Language } from "./detect.js";
 import { execAsync, testSemaphore, syncSemaphores } from "./concurrency.js";
 import { getConfig } from "./config.js";
+import { buildIsolatedEnv } from "./process_env.js";
 
 export interface TestResult {
   totalTests: number;
@@ -22,9 +23,12 @@ export interface TestResult {
   rawOutput: string;
 }
 
+export type FailureType = "test" | "setup" | "compile" | "collection" | "timeout" | "runtime" | "unknown";
+
 export interface FailureDetail {
   testFile: string;
   testName: string;
+  failureType: FailureType;
   error: string;
   expected?: string;
   actual?: string;
@@ -42,15 +46,16 @@ export async function runTests(ws: Workspace): Promise<TestResult> {
 
   const testDirRel = relative(ws.dir, ws.testDir);
   const cmd = env.runner.testCmd.replace(/\{testDir\}/g, testDirRel);
-  const buildTool = env.runner.depManager;
+  const buildTool = env.runner.buildTool || env.runner.depManager;
   const cacheEnv = resolveCacheEnv(env.runner.cacheEnv, ws.dir);
+  const isolatedEnv = buildIsolatedEnv(ws.dir, cacheEnv);
 
   syncSemaphores();
   const cfg = getConfig();
   const testTimeout = cfg?.testTimeout || 300_000;
 
   return testSemaphore.run(async () => {
-    const result = await execAsync(`${cmd} 2>&1`, { cwd: ws.dir, timeout: testTimeout, env: cacheEnv });
+    const result = await execAsync(`${cmd} 2>&1`, { cwd: ws.dir, timeout: testTimeout, env: isolatedEnv, inheritEnv: false });
     const duration = Date.now() - start;
     return parseOutput(ws.language, ws.dir, result.stdout, result.exitCode, duration, buildTool);
   });
@@ -97,7 +102,7 @@ function parseOutput(
     case "ruby":
       return parseRspec(wsDir, rawOutput, exitCode, duration);
     default:
-      return { totalTests: 0, passed: 0, failed: 0, errors: 0, exitCode, duration, failures: [], rawOutput };
+      return finalizeResult({ totalTests: 0, passed: 0, failed: 0, errors: 0, exitCode, duration, failures: [], rawOutput });
   }
 }
 
@@ -130,18 +135,20 @@ function parseVitestJson(json: any, exitCode: number, duration: number, rawOutpu
           passed++;
         } else if (test.status === "failed") {
           failed++;
+          const error = (test.failureMessages || []).join("\n").slice(0, 500);
           failures.push({
             testFile: file.name || "",
             testName: (test.ancestorTitles || []).concat(test.title || "").join(" > "),
-            error: (test.failureMessages || []).join("\n").slice(0, 500),
-            stackLine: extractStack((test.failureMessages || []).join("\n")),
+            failureType: classifyTestFailureType(error),
+            error,
+            stackLine: extractStack(error),
           });
         }
       }
     }
   }
 
-  return { totalTests, passed, failed, errors: 0, exitCode, duration, failures, rawOutput };
+  return finalizeResult({ totalTests, passed, failed, errors: 0, exitCode, duration, failures, rawOutput });
 }
 
 function parseVitestVerbose(output: string, exitCode: number, duration: number): TestResult {
@@ -154,7 +161,7 @@ function parseVitestVerbose(output: string, exitCode: number, duration: number):
     if (line.includes("×") || line.includes("✗")) failed++;
   }
 
-  return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── Pytest (Python) ──
@@ -170,6 +177,17 @@ function parsePytest(output: string, exitCode: number, duration: number): TestRe
   if (passMatch) passed = parseInt(passMatch[1]);
   if (failMatch) failed = parseInt(failMatch[1]);
 
+  const collectingError = output.match(/^ERROR collecting\s+(.+)$/m);
+  if (collectingError) {
+    failures.push({
+      testFile: "",
+      testName: "__collection__",
+      failureType: "collection",
+      error: output.slice(output.indexOf(collectingError[0]), output.indexOf(collectingError[0]) + 500),
+      stackLine: extractStack(output),
+    });
+  }
+
   // Parse FAILURES section for details
   const failSections = output.split(/_{3,} FAILURES _{3,}/);
   if (failSections.length > 1) {
@@ -180,13 +198,14 @@ function parsePytest(output: string, exitCode: number, duration: number): TestRe
       failures.push({
         testFile: "",
         testName: nameMatch?.[1] || "",
+        failureType: classifyTestFailureType(block),
         error: block.slice(0, 500),
         stackLine: extractStack(block),
       });
     }
   }
 
-  return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── Go test ──
@@ -207,6 +226,7 @@ function parseGoTest(output: string, exitCode: number, duration: number): TestRe
         failures.push({
           testFile: ev.Package || "",
           testName: ev.Test,
+          failureType: classifyTestFailureType(ev.Output || ""),
           error: ev.Output || "",
         });
       }
@@ -222,12 +242,12 @@ function parseGoTest(output: string, exitCode: number, duration: number): TestRe
       if (line.match(/^---\s+FAIL:/)) {
         failed++;
         const m = line.match(/^---\s+FAIL:\s+(\S+)/);
-        failures.push({ testFile: "", testName: m?.[1] || "", error: line });
+        failures.push({ testFile: "", testName: m?.[1] || "", failureType: classifyTestFailureType(line), error: line });
       }
     }
   }
 
-  return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── Cargo test (Rust) ──
@@ -248,7 +268,7 @@ function parseCargoTest(output: string, exitCode: number, duration: number): Tes
   const failRe = /^test\s+(\S+)\s+\.\.\.\s+FAILED$/gm;
   let m: RegExpExecArray | null;
   while ((m = failRe.exec(output)) !== null) {
-    failures.push({ testFile: "", testName: m[1], error: "" });
+    failures.push({ testFile: "", testName: m[1], failureType: "test", error: "" });
   }
 
   // Try to attach error messages from failures section
@@ -262,7 +282,7 @@ function parseCargoTest(output: string, exitCode: number, duration: number): Tes
     }
   }
 
-  return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── Maven test (Java) ──
@@ -285,10 +305,10 @@ function parseMaven(output: string, exitCode: number, duration: number): TestRes
   const failRe = /^\s*(\w+)\(([^)]+)\)\s+Time elapsed:.*?<<<\s*(FAILURE|ERROR)!/gm;
   let m: RegExpExecArray | null;
   while ((m = failRe.exec(output)) !== null) {
-    failures.push({ testFile: m[2], testName: m[1], error: m[3] });
+    failures.push({ testFile: m[2], testName: m[1], failureType: classifyTestFailureType(m[3]), error: m[3] });
   }
 
-  return { totalTests: total, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: total, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── Gradle test (Java) ──
@@ -310,7 +330,7 @@ function parseGradle(output: string, exitCode: number, duration: number): TestRe
   const failRe = />\s+(.+?)\s+>\s+(.+?)\s+FAILED/gm;
   let m: RegExpExecArray | null;
   while ((m = failRe.exec(output)) !== null) {
-    failures.push({ testFile: m[1].trim(), testName: m[2].trim(), error: "" });
+    failures.push({ testFile: m[1].trim(), testName: m[2].trim(), failureType: "test", error: "" });
   }
 
   // Attach assertion errors that follow each FAILED line
@@ -324,7 +344,7 @@ function parseGradle(output: string, exitCode: number, duration: number): TestRe
     }
   }
 
-  return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── dotnet test (C#) ──
@@ -345,10 +365,10 @@ function parseDotnet(output: string, exitCode: number, duration: number): TestRe
   const failRe = /^\s*Failed\s+(\S+)/gm;
   let m: RegExpExecArray | null;
   while ((m = failRe.exec(output)) !== null) {
-    failures.push({ testFile: "", testName: m[1], error: "" });
+    failures.push({ testFile: "", testName: m[1], failureType: "test", error: "" });
   }
 
-  return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── swift test ──
@@ -364,11 +384,11 @@ function parseSwiftTest(output: string, exitCode: number, duration: number): Tes
     if (line.includes("' failed")) {
       failed++;
       const m = line.match(/Test Case '([^']+)'/);
-      failures.push({ testFile: "", testName: m?.[1] || "", error: line });
+      failures.push({ testFile: "", testName: m?.[1] || "", failureType: classifyTestFailureType(line), error: line });
     }
   }
 
-  return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── RSpec (Ruby) ──
@@ -392,12 +412,13 @@ function parseRspec(wsDir: string, output: string, exitCode: number, duration: n
           failures.push({
             testFile: ex.file_path || "",
             testName: ex.full_description || "",
+            failureType: classifyTestFailureType(ex.exception?.message || ""),
             error: ex.exception?.message?.slice(0, 500) || "",
           });
         }
       }
 
-      return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+      return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
     } catch {
       // fall through
     }
@@ -411,7 +432,7 @@ function parseRspec(wsDir: string, output: string, exitCode: number, duration: n
     passed = total - failed;
   }
 
-  return { totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output };
+  return finalizeResult({ totalTests: passed + failed, passed, failed, errors: 0, exitCode, duration, failures, rawOutput: output });
 }
 
 // ── Helpers ──
@@ -435,15 +456,90 @@ function extractStack(text: string): string | undefined {
   return undefined;
 }
 
-function errorResult(start: number, message: string): TestResult {
+function classifyTestFailureType(error: string): FailureType {
+  const text = error.toLowerCase();
+  if (text.includes("timed out") || text.includes("timeout")) return "timeout";
+  if (text.includes("syntaxerror") || text.includes("compilation failed") || text.includes("compile error")) return "compile";
+  if (text.includes("exception") || text.includes("panic") || text.includes("segmentation fault")) return "runtime";
+  return "test";
+}
+
+function inferGlobalFailure(rawOutput: string): FailureDetail {
+  const text = rawOutput.toLowerCase();
+  if (text.includes("error collecting") || text.includes("collected 0 items / 1 error")) {
+    return {
+      testFile: "",
+      testName: "__collection__",
+      failureType: "collection",
+      error: rawOutput.slice(0, 500),
+      stackLine: extractStack(rawOutput),
+    };
+  }
+  if (text.includes("compilation failed") || text.includes("compile error") || text.includes("syntaxerror") || /\berror ts\d+/i.test(rawOutput)) {
+    return {
+      testFile: "",
+      testName: "__compile__",
+      failureType: "compile",
+      error: rawOutput.slice(0, 500),
+      stackLine: extractStack(rawOutput),
+    };
+  }
+  if (text.includes("timed out") || text.includes("timeout")) {
+    return {
+      testFile: "",
+      testName: "__timeout__",
+      failureType: "timeout",
+      error: rawOutput.slice(0, 500),
+      stackLine: extractStack(rawOutput),
+    };
+  }
   return {
+    testFile: "",
+    testName: "__setup__",
+    failureType: "setup",
+    error: rawOutput.slice(0, 500),
+    stackLine: extractStack(rawOutput),
+  };
+}
+
+function syntheticTestName(failureType: FailureType): string {
+  switch (failureType) {
+    case "collection":
+      return "__collection__";
+    case "compile":
+      return "__compile__";
+    case "timeout":
+      return "__timeout__";
+    case "setup":
+      return "__setup__";
+    default:
+      return "__test__";
+  }
+}
+
+function finalizeResult(result: TestResult): TestResult {
+  const failures = result.failures.map((failure) => ({
+    ...failure,
+    testName: failure.testName || syntheticTestName(failure.failureType),
+    failureType: failure.failureType || "unknown",
+  }));
+
+  if (result.exitCode !== 0 && failures.length === 0) {
+    failures.push(inferGlobalFailure(result.rawOutput));
+  }
+
+  return { ...result, failures };
+}
+
+function errorResult(start: number, message: string): TestResult {
+  return finalizeResult({
     totalTests: 0,
     passed: 0,
     failed: 0,
     errors: 1,
     exitCode: 1,
     duration: Date.now() - start,
-    failures: [{ testFile: "", testName: "", error: message }],
+    failures: [{ testFile: "", testName: "__setup__", failureType: "setup", error: message }],
     rawOutput: "",
-  };
+  });
 }

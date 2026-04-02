@@ -5,8 +5,9 @@
   "author": "Lily Huang",
   "license": "MIT",
   "type": "module",
-  "bin": {
-    "sentinel": "./server.ts"
+  "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",

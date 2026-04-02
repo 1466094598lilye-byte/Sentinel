@@ -90,8 +90,7 @@ export function formatConfigProposal(config: SentinelConfig, scan: ScanResult): 
   const lines: string[] = [];
   const cores = cpus().length;
   const memGB = Math.round(totalmem() / (1024 ** 3));
-
-  lines.push(`## Proposed Run Configuration`);
+  lines.push(`## Proposed Sentinel Configuration`);
   lines.push(``);
   lines.push(`### Detected Environment`);
   lines.push(`| Setting | Value |`);

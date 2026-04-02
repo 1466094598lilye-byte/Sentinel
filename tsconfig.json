@@ -3,10 +3,11 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "resolveJsonModule": true,
     "esModuleInterop": true,
     "strict": true,
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "lib/**/*.ts", "bin/**/*.ts"]
+  "include": ["server.ts", "index.ts", "lib/**/*.ts"]
 }

@@ -1,36 +1,33 @@
-#!/usr/bin/env npx tsx
 /**
  * Sentinel MCP Server — AI testing agent.
  *
  * Works with any MCP-compatible host: Claude Code, Cursor, Windsurf, VS Code Copilot.
  *
- * Four-perspective testing with Island Algorithm:
+ * Six-tool MCP flow for four-perspective testing:
  *   1. sentinel_scan  — Scan project, return context + source code
- *   2. sentinel_pm    — PM defines UX acceptance criteria (island algorithm, 4 tiers)
- *   3. sentinel_test  — Dual Tester: system (correctness) + user (UX criteria)
- *   4. sentinel_hack  — Hacker finds what everyone missed (island algorithm, 6 skills)
- *   5. sentinel_run   — Execute merged test files, return structured results
+ *   2. sentinel_config — Confirm execution config before PM/test/hack phases
+ *   3. sentinel_pm    — PM defines UX acceptance criteria (island algorithm, 4 tiers)
+ *   4. sentinel_test  — Dual Tester: system (correctness) + user (UX criteria)
+ *   5. sentinel_hack  — Hacker finds what everyone missed (island algorithm, 6 skills)
+ *   6. sentinel_report — Turn host-run failures into a final T-tier report
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { execSync } from "child_process";
+import packageJson from "./package.json" with { type: "json" };
 import { scan } from "./lib/detect.js";
-import { createWorkspace, installDeps, writeTestFiles, destroyWorkspace, saveTestFiles } from "./lib/workspace.js";
-import { runTests } from "./lib/executor.js";
-import { formatReport, formatScanContext, formatScanContextShuffled, formatFailureContext } from "./lib/reporter.js";
-import { proposeConfig, formatConfigProposal, setConfig, clearConfig } from "./lib/config.js";
+import { formatScanContext, formatTierReportInput } from "./lib/reporter.js";
+import { proposeConfig, formatConfigProposal, setConfig } from "./lib/config.js";
 import { syncSemaphores } from "./lib/concurrency.js";
-import { detectProvider } from "./lib/llm.js";
+import { IsolationVault, describeArtifact, formatIsolationCapsule } from "./lib/isolation.js";
 import type { SentinelConfig } from "./lib/config.js";
 import type { ScanResult } from "./lib/detect.js";
-import type { Workspace } from "./lib/workspace.js";
 
 // ── State ──
-const activeWorkspaces = new Map<string, Workspace>();
 const lastScanResults = new Map<string, ScanResult>();
-const pendingScan = new Map<string, { result: ScanResult; scope?: string }>();
+const pendingScan = new Map<string, { result: ScanResult }>();
 const lastIntent = new Map<string, string>();
 const lastPMCriteria = new Map<string, string>();
 const lastTesterPlan = new Map<string, string>();
@@ -39,23 +36,17 @@ const pmRound = new Map<string, number>();
 const pmResearch = new Map<string, string>();
 
 const SESSION = "default"; // MCP is single-session via stdio
+const isolationVault = new IsolationVault();
 
-// djb2 hash for seeded shuffle
-function djb2Hash(str: string): number {
-  let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) + hash + str.charCodeAt(i)) | 0;
-  }
-  return Math.abs(hash);
-}
+const FULL_REPO_GUIDANCE =
+  "Context is FULL REPOSITORY. Read the full project structure, then focus your tests on the highest-risk contracts, boundaries, state transitions, and user-facing failure modes.";
 
-// ── Scope guidance ──
-const SCOPE_GUIDANCE: Record<string, string> = {
-  commit: "Scope is COMMIT (uncommitted changes only). Generate 2-4 focused tests per changed function. Only test the changed code and its direct callers.",
-  branch: "Scope is BRANCH (all changes since diverged from main). Generate 5-8 tests per changed module, including edge cases and negative tests.",
-  changes: "Scope is CHANGES (specific files). Generate 3-5 tests per changed function, covering happy path and key edge cases.",
-  full: "Scope is FULL (entire project). Generate comprehensive tests across all 6 categories: Functional, Boundary, Stability, Recovery, Integration, Resource.",
-};
+const HOST_EXECUTION_GUIDANCE = [
+  "Sentinel does not execute tests through MCP.",
+  "After you generate the final runnable test files, have the host coding agent write them into its own workspace and run them with its own terminal or sandbox.",
+  "Do not ask Sentinel to execute them. Execution belongs to the host agent that generated the code.",
+  "After the host run completes, call sentinel_report with each failure item's test_name, failure_type, and error_message to produce the final T-tier report.",
+].join(" ");
 
 // ══════════════════════════════════════════
 // PM Prompt Components
@@ -204,11 +195,20 @@ const PM_OUTPUT_FORMAT = `
 - Why users care: one sentence connecting to real user behavior
 - Severity: FAIL (must fix) or WARNING (should fix)
 
+## Coverage Ledger
+- Components examined: which modules/functions you actually reasoned about
+- Weak spots: components you did NOT fully understand or only touched lightly
+- Surprise: one non-obvious risk or user failure mode you did not expect at first glance
+
+## Next Frontier
+- List 2 surfaces the NEXT isolated pass should pressure-test because they still feel under-explored, over-trusted, or deceptively harmless
+
 ## Constraints:
 - Walk through the API surface SYSTEMATICALLY for this tier.
 - Produce at least 3 criteria for THIS tier.
 - Every criterion MUST have a concrete, testable threshold.
 - Think about the REAL user — who are they? What are they trying to do?
+- Prefer one genuinely non-obvious criterion over several obvious rewrites of the same concern.
 `;
 
 const PM_CROSS_PROMPT = `
@@ -223,11 +223,13 @@ Each analyst focused on ONE frustration tier and worked independently.
 2. **Compounding**: A T3 issue combined with a T2 issue = user gives up entirely (T1).
 3. **Hidden T1s**: Issues classified as T3/T4 that are actually T1 under specific conditions.
 4. **Indirect cost chains**: A T3 per-interaction overhead that injects content into LLM context = T1 silent token cost.
+5. **Coverage recovery**: Find important components that appeared weakly covered or not covered at all in the tier outputs, then ask what catastrophic UX failure could originate there.
 
 ## Rules:
 - Every cross-tier finding must reference ≥2 original tier findings
 - Show the escalation chain: "T4 finding X + T3 finding Y = T1 scenario Z"
 - Produce at least 3 NEW cross-tier criteria
+- Prefer compound failures, second-order effects, and under-explored surfaces over restating obvious issues.
 - Report: "N new cross-tier criteria found" (< 2 = converge, ≥ 2 = another round, max 3 rounds)
 
 ## Output format:
@@ -235,6 +237,9 @@ Each analyst focused on ONE frustration tier and worked independently.
 - Escalation chain: T{A} finding + T{B} finding → combined impact
 - Threshold: concrete pass/fail condition for the combined scenario
 - Why this is worse than either alone: one sentence
+
+## Next Frontier
+- List 2 components or user journeys that still feel under-explored after this cross pass
 `;
 
 const PM_MERGE_PROMPT = `
@@ -249,6 +254,7 @@ You are merging the complete PM criteria from all rounds.
 - Ensure every tier has at least 3 criteria
 - Tag each: [PM][Tier N] or [PM][Cross]
 - Show stats: "X criteria total: T1=a, T2=b, T3=c, T4=d, Cross=e"
+- Preserve surprising, high-leverage criteria even if they are fewer; do not collapse everything into generic boilerplate.
 
 Present the merged PM criteria. After approval, call sentinel_pm with tier="done" and the full criteria to proceed to the Tester phase.
 `;
@@ -304,7 +310,7 @@ Output a COMPLETE, RUNNABLE test file. Use the test runner detected for this pro
 - Include describe blocks with [T-Sys] prefix for traceability
 - Do NOT output a plan or description — output ONLY executable test code
 
-Present the test code to the user. After approval, it will be passed to sentinel_run.
+Present the test code to the host coding agent. After approval, the host agent should write the test files into its own workspace and run them directly.
 `;
 
 // ══════════════════════════════════════════
@@ -349,7 +355,7 @@ Output a COMPLETE, RUNNABLE test file. Use the test runner detected for this pro
 - Every PM criterion tagged FAIL is MANDATORY
 - Every PM criterion tagged WARNING should be covered if feasible
 
-Present the test code to the user. After approval, it will be passed to sentinel_run.
+Present the test code to the host coding agent. After approval, the host agent should write the test files into its own workspace and run them directly.
 `;
 
 // ══════════════════════════════════════════
@@ -467,12 +473,21 @@ Include describe blocks with [H][Skill {SKILL_ID}] prefix. Each attack needs:
 - An assertion for the expected defense
 - A comment noting "blast radius if undefended"
 
+## Coverage Ledger
+- Components attacked: which modules/functions you actually pressured
+- Input classes tried: the payload families you explored
+- Suspicious but unbroken: what still feels too trusted, too quiet, or too lightly exercised
+
+## Next Frontier
+- List 2 follow-up attack leads the NEXT isolated pass should pursue because they may unlock a deeper chain or a wider blast radius
+
 ## Constraints:
 - Walk through the API surface SYSTEMATICALLY.
 - Produce at least 3 attacks the Tester missed for THIS skill.
 - Each attack must have a CONCRETE payload.
 - Prefer SILENT corruption over crashes.
 - Cross-reference PM criteria: T1/T2 concerns get attacked harder.
+- At least one attack should come from a surface that does NOT look obviously dangerous at first glance.
 `;
 
 const HACKER_CROSS_PROMPT = `
@@ -486,17 +501,22 @@ You are a black-hat attacker reviewing the combined findings from 6 specialized 
 2. **State + Timing combos**: Race condition + state corruption = unrecoverable mode.
 3. **Injection → Impact**: Connect injection points to concrete damage paths.
 4. **Resource amplification**: One expensive call triggered in a loop through another finding.
+5. **Coverage gap exploitation**: Start from components that were barely attacked in the individual skill passes and ask how they could become the first step of a larger chain.
 
 ## Rules:
 - Every chain must be ≥2 steps
 - Show the COMPLETE chain with concrete payloads
 - Produce at least 3 NEW chain attacks
+- Prefer new blast radius and surprising entry points over "same bug, bigger payload".
 - Report: "N new chain attacks found" (<2 = converge)
 
 ## Output format
 Output **runnable test code** for each chain attack using the project's test runner.
 Each test must assert the EXPECTED DEFENSE — test FAILS if the chain vulnerability exists.
 Include describe blocks with [H][Chain] prefix.
+
+## Next Frontier
+- List 2 attack leads that still look promising after this chaining pass
 `;
 
 const HACKER_MERGE_PROMPT = `
@@ -514,14 +534,15 @@ You are merging test code from the Tester phase and the Hacker phase into final 
 - If a Tester test overlaps with a Hacker attack but the Hacker version is nastier, replace it (tag [T+H])
 - Deduplicate tests that assert the same thing
 - Show coverage stats: "X from Tester, Y unique from Hacker, Z upgraded, C chain attacks"
+- Preserve attacks that open new surfaces or new blast radii even if they are fewer than the obvious repeated attacks.
 
 ## CRITICAL — Assertion Direction Check
 Before outputting, review EVERY expect() call. Ask: "Does this test FAIL when the bug exists?"
 - If the test would PASS on broken code → flip the assertion
 - If the test is a placeholder (expect(true).toBe(true)) → replace with a real assertion or remove
 
-Output the final merged test file(s) as COMPLETE, RUNNABLE code ready for sentinel_run.
-Call sentinel_run with the test file contents.
+Output the final merged test file(s) as COMPLETE, RUNNABLE code ready for the host coding agent to execute directly.
+Tell the host agent to write these test files and run them in its own terminal or sandbox.
 `;
 
 // ══════════════════════════════════════════
@@ -530,7 +551,7 @@ Call sentinel_run with the test file contents.
 
 const server = new McpServer({
   name: "sentinel",
-  version: "0.2.0",
+  version: packageJson.version,
 }, {
   capabilities: { tools: {} },
 });
@@ -540,12 +561,90 @@ function text(t: string) {
   return { content: [{ type: "text" as const, text: t }] };
 }
 
+function clearScanArtifacts(sessionKey: string): void {
+  lastScanResults.delete(sessionKey);
+  pendingScan.delete(sessionKey);
+}
+
 function getGitDiffFingerprint(dir: string): string {
   try {
     return execSync("git diff --name-only HEAD 2>/dev/null && git diff --name-only --cached 2>/dev/null", {
       cwd: dir, encoding: "utf-8", timeout: 5_000,
     }).trim();
   } catch { return ""; }
+}
+
+function joinSections(sections: string[]): string {
+  return sections.filter(Boolean).join("\n\n");
+}
+
+function getLatestTesterPlans(sessionKey: string): { system: string; user: string } {
+  const systemArtifact = isolationVault.latest(sessionKey, { kind: "tester_system" });
+  const userArtifact = isolationVault.latest(sessionKey, { kind: "tester_user" });
+  return {
+    system: systemArtifact?.content || lastTesterPlan.get(sessionKey + ":system") || "",
+    user: userArtifact?.content || lastTesterPlan.get(sessionKey + ":user") || "",
+  };
+}
+
+function getPMRoundResults(sessionKey: string, round: number): string {
+  const tierArtifacts = isolationVault.list(sessionKey, { kind: "pm_tier", round });
+  const crossArtifacts = isolationVault.list(sessionKey, { kind: "pm_cross", round });
+
+  return joinSections([
+    ...tierArtifacts.map((artifact) =>
+      `### ${describeArtifact(artifact)}\n${artifact.content}`,
+    ),
+    ...crossArtifacts.map((artifact) =>
+      `### ${describeArtifact(artifact)}\n${artifact.content}`,
+    ),
+  ]);
+}
+
+function getAllPMResults(sessionKey: string): string {
+  const research = isolationVault.latest(sessionKey, { kind: "pm_research" });
+  const tierArtifacts = isolationVault.list(sessionKey, { kind: "pm_tier" });
+  const crossArtifacts = isolationVault.list(sessionKey, { kind: "pm_cross" });
+
+  return joinSections([
+    research ? `### ${describeArtifact(research)}\n${research.content}` : "",
+    ...tierArtifacts.map((artifact) =>
+      `### ${describeArtifact(artifact)}\n${artifact.content}`,
+    ),
+    ...crossArtifacts.map((artifact) =>
+      `### ${describeArtifact(artifact)}\n${artifact.content}`,
+    ),
+  ]);
+}
+
+function getHackRoundResults(sessionKey: string, round: number): string {
+  const skillArtifacts = isolationVault.list(sessionKey, { kind: "hack_skill", round });
+  const crossArtifacts = isolationVault.list(sessionKey, { kind: "hack_cross", round });
+
+  return joinSections([
+    ...skillArtifacts.map((artifact) =>
+      `### ${describeArtifact(artifact)}\n${artifact.content}`,
+    ),
+    ...crossArtifacts.map((artifact) =>
+      `### ${describeArtifact(artifact)}\n${artifact.content}`,
+    ),
+  ]);
+}
+
+function getAllHackResults(sessionKey: string): string {
+  const skillArtifacts = isolationVault.list(sessionKey, { kind: "hack_skill" });
+  const crossArtifacts = isolationVault.list(sessionKey, { kind: "hack_cross" });
+  const mergeArtifact = isolationVault.latest(sessionKey, { kind: "hack_merge" });
+
+  return joinSections([
+    ...skillArtifacts.map((artifact) =>
+      `### ${describeArtifact(artifact)}\n${artifact.content}`,
+    ),
+    ...crossArtifacts.map((artifact) =>
+      `### ${describeArtifact(artifact)}\n${artifact.content}`,
+    ),
+    mergeArtifact ? `### ${describeArtifact(mergeArtifact)}\n${mergeArtifact.content}` : "",
+  ]);
 }
 
 // ══════════════════════════════════════════
@@ -557,16 +656,16 @@ server.tool(
   "Scan a project for testing. Pass intent (one sentence: what is this project for?) to enable intent-gap detection. If intent is not provided, ASK THE USER before proceeding.",
   {
     target: z.string().describe("Absolute path to the project directory to test"),
-    scope: z.enum(["commit", "branch", "changes", "full"]).optional().describe("Test scope. If omitted, auto-detected from git state."),
     intent: z.string().optional().describe('One sentence: "What is this project for?" If unknown, ASK the user first.'),
   },
-  async ({ target, scope, intent }) => {
-    const result = scan(target, scope);
+  async ({ target, intent }) => {
+    clearScanArtifacts(SESSION);
+    const result = scan(target);
 
     // ── Gate: no intent → block pipeline, force calibration ──
     if (!intent) {
       // Store scan internally but do NOT expose results to host LLM
-      pendingScan.set(SESSION, { result, scope });
+      pendingScan.set(SESSION, { result });
       return text([
         `# Calibration Required`,
         "",
@@ -578,7 +677,7 @@ server.tool(
         "",
         `Then call sentinel_scan again with the same target and \`intent\` set to the user's answer.`,
         "",
-        `⛔ sentinel_pm, sentinel_test, sentinel_hack, and sentinel_run will not work until calibration is complete.`,
+        `⛔ sentinel_pm, sentinel_test, and sentinel_hack will not work until calibration is complete.`,
       ].join("\n"));
     }
 
@@ -603,7 +702,7 @@ server.tool(
 
 server.tool(
   "sentinel_config",
-  "Confirm or modify the run configuration proposed by sentinel_scan. Call AFTER scan, BEFORE pm.",
+  "Confirm or modify the Sentinel configuration proposed by sentinel_scan. Call AFTER scan, BEFORE pm.",
   {
     installTimeout: z.number().optional(),
     testTimeout: z.number().optional(),
@@ -626,8 +725,6 @@ server.tool(
     setConfig(config);
     syncSemaphores();
 
-    const scopeGuide = SCOPE_GUIDANCE[scanResult.scope] || SCOPE_GUIDANCE.full;
-
     // Time estimate based on island algorithm config
     const pmCalls = (config.pmIslands || 4) + 1 + 1; // tiers + cross + merge
     const hackerCalls = (config.hackerIslands || 6) + 1 + 1; // skills + cross + merge
@@ -644,7 +741,7 @@ server.tool(
       timeEstimate, "",
       `---`,
       `Configuration locked. Proceed to the PM phase:`, "",
-      `Scope: ${scopeGuide}`, "",
+      `Context: ${FULL_REPO_GUIDANCE}`, "",
       `**Step 1**: Call sentinel_pm with tier="research" to do competitive analysis first.`,
       `**Step 2**: Then tier=1 through tier=4 for island exploration.`,
       `Or call sentinel_pm without tier for legacy single-pass mode.`,
@@ -675,66 +772,121 @@ server.tool(
     // Branch 0: Market research
     if (tier === "research") {
       if (tierResults) {
+        const artifact = isolationVault.store(SESSION, "pm_research", tierResults);
         pmResearch.set(SESSION, tierResults);
-        return text(`# PM Research Stored\n\nCategory risk profile saved. Now call sentinel_pm with tier=1 to begin.`);
+        return text(`# PM Research Stored\n\nCategory risk profile saved as ${describeArtifact(artifact)}.\nNow call sentinel_pm with tier=1 to begin.`);
       }
       const sourceContext = formatScanContext(scanResult);
-      return text([`# PM Market Research Phase`, "", sourceContext, "", PM_RESEARCH_PROMPT].join("\n"));
+      const capsule = formatIsolationCapsule("PM Research", [
+        "Visible: scan context only.",
+        "Hidden by Sentinel: tester plans, hacker findings, and PM criteria from later phases.",
+      ]);
+      return text([`# PM Market Research Phase`, "", capsule, "", sourceContext, "", PM_RESEARCH_PROMPT].join("\n"));
     }
 
     // Branch 1: Focused tier pass (1-4)
     if (typeof tier === "number" && tier >= 1 && tier <= 4) {
       const round = pmRound.get(SESSION) || 1;
+      if (tierResults) {
+        const artifact = isolationVault.store(SESSION, "pm_tier", tierResults, { round, tier });
+        return text([
+          `# PM Tier Stored`,
+          "",
+          `Stored ${describeArtifact(artifact)} inside Sentinel's isolation vault.`,
+          tier < 4
+            ? `Next: call sentinel_pm with tier=${tier + 1} to open the next isolated PM cabin.`
+            : `All 4 tiers for round ${round} are stored. Call sentinel_pm with tier="cross" to open the cross-tier cabin.`,
+        ].join("\n"));
+      }
       const t = PM_TIERS[tier - 1];
-      const seed = djb2Hash(`${SESSION}-pm-round${round}-tier${tier}`);
-      const shuffledContext = formatScanContextShuffled(scanResult, seed);
-      const research = pmResearch.get(SESSION) || "(No competitive research done — consider running tier='research' first)";
+      const structuredContext = formatScanContext(scanResult);
+      const researchArtifact = isolationVault.latest(SESSION, { kind: "pm_research" });
+      const research = researchArtifact?.content || pmResearch.get(SESSION) || "(No competitive research done — consider running tier='research' first)";
       const prompt = PM_PREAMBLE
         .replace("{TIER_NAME}", t.name)
         .replace("{TIER_GOAL}", t.goal)
         .replace("{RESEARCH_CONTEXT}", research);
+      const capsule = formatIsolationCapsule(`PM Tier ${tier} / Round ${round}`, [
+        researchArtifact
+          ? `Visible research artifact: ${describeArtifact(researchArtifact)}.`
+          : "Visible research artifact: none.",
+        "Hidden by Sentinel: tester plans, hacker findings, and sibling PM tier outputs.",
+        "Exploration rule: keep the source structure stable and focus only on this tier's concern.",
+      ]);
       const tierSection = `## Analysis focus: Tier ${t.id} — ${t.name}\n${t.prompt}`;
       const outputFmt = PM_OUTPUT_FORMAT.replace("{TIER_ID}", String(t.id));
       const nextHint = tier < 4
-        ? `\n\n---\nNext: call sentinel_pm with tier=${tier + 1}.`
-        : `\n\n---\nAll 4 tiers complete. Call sentinel_pm with tier="cross" and tierResults=<all 4 results concatenated>.`;
+        ? `\n\n---\nAfter generating this tier, store it by calling sentinel_pm with tier=${tier} and tierResults=<your output>. Then open tier=${tier + 1}.`
+        : `\n\n---\nAfter generating this tier, store it by calling sentinel_pm with tier=4 and tierResults=<your output>. Then call sentinel_pm with tier="cross" to combine only the stored PM artifacts for this round.`;
 
       return text([
         `# PM Island ${tier}/4 (Round ${round}) — ${t.name}`, "",
-        shuffledContext, "", prompt, "", tierSection, "", outputFmt, nextHint,
+        capsule, "", structuredContext, "", prompt, "", tierSection, "", outputFmt, nextHint,
       ].join("\n"));
     }
 
     // Branch 2: Cross-tier escalation
     if (tier === "cross") {
-      if (!tierResults) return text("Error: tier='cross' requires tierResults parameter.");
       const round = pmRound.get(SESSION) || 1;
-      const crossPrompt = PM_CROSS_PROMPT.replace("{ROUND}", String(round)).replace("{TIER_RESULTS}", tierResults);
+      if (tierResults) {
+        const artifact = isolationVault.store(SESSION, "pm_cross", tierResults, { round });
+        pmRound.set(SESSION, round + 1);
+        return text([
+          `# PM Cross-Tier Stored`,
+          "",
+          `Stored ${describeArtifact(artifact)} inside Sentinel's isolation vault.`,
+          `If this cross-tier pass found enough new criteria, call sentinel_pm with tier=1 to open round ${round + 1}.`,
+          `If it converged, call sentinel_pm with tier="merge" to merge only the stored PM artifacts.`,
+        ].join("\n"));
+      }
+      const tierResultsForRound = getPMRoundResults(SESSION, round);
+      if (!tierResultsForRound) {
+        return text(`Error: No stored PM tier artifacts found for round ${round}. Store tier results first.`);
+      }
+      const capsule = formatIsolationCapsule(`PM Cross / Round ${round}`, [
+        `Visible artifacts: only stored PM tier results from round ${round}.`,
+        "Hidden by Sentinel: tester plans, hacker findings, and future PM rounds.",
+      ]);
+      const crossPrompt = PM_CROSS_PROMPT.replace("{ROUND}", String(round)).replace("{TIER_RESULTS}", tierResultsForRound);
       const nextHint = [
         "", "---",
-        `Count your NEW cross-tier findings.`,
-        `- ≥ 2 new: call sentinel_pm with tier=1 for Round ${round + 1}.`,
-        `- < 2 new: CONVERGE. Call sentinel_pm with tier="merge" and tierResults=<everything>.`,
-        round >= 3 ? `- **Round 3 reached — MUST converge. Call tier="merge" next.**` : "",
+        `After generating cross-tier findings, store them by calling sentinel_pm with tier="cross" and tierResults=<your output>.`,
+        `- If the stored cross result found ≥ 2 new criteria: open round ${round + 1} with tier=1.`,
+        `- If it converged: call sentinel_pm with tier="merge" to merge only the stored PM artifacts.`,
+        round >= 3 ? `- **Round 3 reached — MUST converge after storing this pass.**` : "",
       ].join("\n");
-      pmRound.set(SESSION, round + 1);
-      return text([`# PM Cross-Tier Escalation — Round ${round}`, "", crossPrompt, nextHint].join("\n"));
+      return text([`# PM Cross-Tier Escalation — Round ${round}`, "", capsule, "", crossPrompt, nextHint].join("\n"));
     }
 
     // Branch 3: Merge
     if (tier === "merge") {
-      if (!tierResults) return text("Error: tier='merge' requires tierResults parameter.");
+      if (tierResults) {
+        const artifact = isolationVault.store(SESSION, "pm_merge", tierResults);
+        return text([
+          `# PM Merge Stored`,
+          "",
+          `Stored ${describeArtifact(artifact)} inside Sentinel's isolation vault.`,
+          `Next: call sentinel_pm with tier="done" to promote the latest merged PM criteria.`,
+        ].join("\n"));
+      }
+      const allResults = getAllPMResults(SESSION);
+      if (!allResults) return text("Error: No stored PM artifacts found. Run and store PM phases first.");
       pmRound.delete(SESSION);
-      return text([`# PM Criteria Merge`, "", PM_MERGE_PROMPT.replace("{ALL_RESULTS}", tierResults)].join("\n"));
+      const capsule = formatIsolationCapsule("PM Merge", [
+        "Visible artifacts: stored PM research, tier, and cross outputs only.",
+        "Hidden by Sentinel: tester plans and hacker findings.",
+      ]);
+      return text([`# PM Criteria Merge`, "", capsule, "", PM_MERGE_PROMPT.replace("{ALL_RESULTS}", allResults)].join("\n"));
     }
 
     // Branch 4: Done
     if (tier === "done") {
-      if (!tierResults) return text("Error: tier='done' requires tierResults with the final merged PM criteria.");
-      lastPMCriteria.set(SESSION, tierResults);
+      const finalCriteria = tierResults || isolationVault.latest(SESSION, { kind: "pm_merge" })?.content;
+      if (!finalCriteria) return text("Error: No merged PM criteria found. Store a merge result first.");
+      lastPMCriteria.set(SESSION, finalCriteria);
       return text([
         `# PM Phase Complete — Proceed to Dual Tester Phase`, "",
-        `PM criteria stored (${tierResults.length} chars).`, "",
+        `PM criteria stored (${finalCriteria.length} chars).`, "",
         `**System Tester**: Call sentinel_test with role="system".`,
         `**User Tester**: Call sentinel_test with role="user".`,
         `Run both, then pass BOTH plans to sentinel_hack.`,
@@ -760,16 +912,44 @@ server.tool(
   "Generate test plans. role='system': correctness only. role='user': translates PM criteria into UX tests.",
   {
     role: z.enum(["system", "user"]).describe("Which tester perspective"),
+    plan: z.string().optional().describe("Store the generated tester output inside Sentinel's isolation vault."),
   },
-  async ({ role }) => {
+  async ({ role, plan }) => {
     const scanResult = lastScanResults.get(SESSION);
     if (!scanResult) return text("Error: No scan result found. Call sentinel_scan first.");
 
+    if (plan) {
+      const kind = role === "system" ? "tester_system" : "tester_user";
+      const artifact = isolationVault.store(SESSION, kind, plan);
+      lastTesterPlan.set(SESSION + `:${role}`, plan);
+      return text([
+        `# Tester Plan Stored`,
+        "",
+        `Stored ${describeArtifact(artifact)} inside Sentinel's isolation vault.`,
+        role === "system"
+          ? `Next: call sentinel_test with role="user" to open the UX tester cabin.`
+          : `Both tester cabins can now be consumed by sentinel_hack without re-pasting their contents.`,
+      ].join("\n"));
+    }
+
     const sourceContext = formatScanContext(scanResult);
-    const scopeGuide = SCOPE_GUIDANCE[scanResult.scope] || SCOPE_GUIDANCE.full;
+    const capsule = role === "system"
+      ? formatIsolationCapsule("System Tester", [
+        "Visible: scan context only.",
+        "Hidden by Sentinel: PM criteria, user tester output, and hacker findings.",
+      ])
+      : formatIsolationCapsule("User Tester", [
+        "Visible: scan context and the promoted PM criteria only.",
+        "Hidden by Sentinel: system tester output and hacker findings.",
+      ]);
 
     if (role === "system") {
-      return text([`# System Tester — Code Correctness`, "", sourceContext, "", scopeGuide, "", SYSTEM_TESTER_PROMPT].join("\n"));
+      return text([
+        `# System Tester — Code Correctness`, "",
+        capsule, "", sourceContext, "", FULL_REPO_GUIDANCE, "", SYSTEM_TESTER_PROMPT,
+        "",
+        `After generating the plan, store it by calling sentinel_test with role="system" and plan=<your output>.`,
+      ].join("\n"));
     }
 
     const pmCriteria = lastPMCriteria.get(SESSION);
@@ -777,8 +957,10 @@ server.tool(
 
     return text([
       `# User Tester — UX Criteria Validation`, "",
-      sourceContext, "", scopeGuide, "",
+      capsule, "", sourceContext, "", FULL_REPO_GUIDANCE, "",
       USER_TESTER_PROMPT.replace("{PM_CRITERIA}", pmCriteria),
+      "",
+      `After generating the plan, store it by calling sentinel_test with role="user" and plan=<your output>.`,
     ].join("\n"));
   },
 );
@@ -803,10 +985,17 @@ server.tool(
     const scanResult = lastScanResults.get(SESSION);
     if (!scanResult) return text("Error: No scan result found. Call sentinel_scan first.");
 
-    if (systemPlan) lastTesterPlan.set(SESSION + ":system", systemPlan);
-    if (userPlan) lastTesterPlan.set(SESSION + ":user", userPlan);
-    const sp = lastTesterPlan.get(SESSION + ":system") || systemPlan || "";
-    const up = lastTesterPlan.get(SESSION + ":user") || userPlan || "";
+    if (systemPlan) {
+      lastTesterPlan.set(SESSION + ":system", systemPlan);
+      isolationVault.store(SESSION, "tester_system", systemPlan);
+    }
+    if (userPlan) {
+      lastTesterPlan.set(SESSION + ":user", userPlan);
+      isolationVault.store(SESSION, "tester_user", userPlan);
+    }
+    const testerPlans = getLatestTesterPlans(SESSION);
+    const sp = testerPlans.system;
+    const up = testerPlans.user;
     const pmCriteria = lastPMCriteria.get(SESSION) || "(PM phase skipped)";
 
     if (!sp && !up) return text("Error: No tester plans. Pass systemPlan and/or userPlan on the first sentinel_hack call.");
@@ -819,49 +1008,95 @@ server.tool(
     // Branch 1: Focused skill pass (1-6)
     if (typeof skill === "number" && skill >= 1 && skill <= 6) {
       const round = hackRound.get(SESSION) || 1;
+      if (skillResults) {
+        const artifact = isolationVault.store(SESSION, "hack_skill", skillResults, { round, skill });
+        return text([
+          `# Hacker Skill Stored`,
+          "",
+          `Stored ${describeArtifact(artifact)} inside Sentinel's isolation vault.`,
+          skill < 6
+            ? `Next: call sentinel_hack with skill=${skill + 1} to open the next isolated hacker cabin.`
+            : `All 6 hacker skills for round ${round} are stored. Call sentinel_hack with skill="cross" to chain only the stored hacker artifacts.`,
+        ].join("\n"));
+      }
       const s = HACKER_SKILLS[skill - 1];
-      const seed = djb2Hash(`${SESSION}-round${round}-skill${skill}`);
-      const shuffledContext = formatScanContextShuffled(scanResult, seed);
+      const structuredContext = formatScanContext(scanResult);
       const prompt = HACKER_PREAMBLE
         .replace("{SKILL_NAME}", s.name)
         .replace("{SKILL_GOAL}", s.goal)
         .replace("{PM_CRITERIA}", pmCriteria)
         .replace("{SYSTEM_PLAN}", sp)
         .replace("{USER_PLAN}", up);
+      const capsule = formatIsolationCapsule(`Hacker Skill ${skill} / Round ${round}`, [
+        "Visible: scan context, promoted PM criteria, and the latest stored tester plans.",
+        "Hidden by Sentinel: sibling hacker skill outputs and future hacker rounds.",
+        "Exploration rule: keep the source structure stable and push deeper only within this skill's attack lane.",
+      ]);
       const skillSection = `## Attack methodology: ${s.name}\n${s.prompt}`;
       const outputFmt = HACKER_OUTPUT_FORMAT.replace("{SKILL_ID}", String(s.id));
       const nextHint = skill < 6
-        ? `\n\n---\nNext: call sentinel_hack with skill=${skill + 1}.`
-        : `\n\n---\nAll 6 skills complete. Call sentinel_hack with skill="cross" and skillResults=<all 6 results concatenated>.`;
+        ? `\n\n---\nAfter generating this hacker pass, store it by calling sentinel_hack with skill=${skill} and skillResults=<your output>. Then open skill=${skill + 1}.`
+        : `\n\n---\nAfter generating this hacker pass, store it by calling sentinel_hack with skill=6 and skillResults=<your output>. Then call sentinel_hack with skill="cross" to chain only the stored hacker artifacts from this round.`;
 
       return text([
         `# Hacker Island ${skill}/6 (Round ${round}) — ${s.name}`, "",
-        shuffledContext, "", prompt, "", skillSection, "", outputFmt, nextHint,
+        capsule, "", structuredContext, "", prompt, "", skillSection, "", outputFmt, nextHint,
       ].join("\n"));
     }
 
     // Branch 2: Cross-pollination
     if (skill === "cross") {
-      if (!skillResults) return text("Error: skill='cross' requires skillResults parameter.");
       const round = hackRound.get(SESSION) || 1;
-      const crossPrompt = HACKER_CROSS_PROMPT.replace("{ROUND}", String(round)).replace("{SKILL_RESULTS}", skillResults);
+      if (skillResults) {
+        const artifact = isolationVault.store(SESSION, "hack_cross", skillResults, { round });
+        hackRound.set(SESSION, round + 1);
+        return text([
+          `# Hacker Cross Stored`,
+          "",
+          `Stored ${describeArtifact(artifact)} inside Sentinel's isolation vault.`,
+          `If this chaining pass found enough new attacks, call sentinel_hack with skill=1 to open round ${round + 1}.`,
+          `If it converged, call sentinel_hack with skill="merge" to merge only the stored hacker artifacts.`,
+        ].join("\n"));
+      }
+      const skillResultsForRound = getHackRoundResults(SESSION, round);
+      if (!skillResultsForRound) {
+        return text(`Error: No stored hacker skill artifacts found for round ${round}. Store skill results first.`);
+      }
+      const capsule = formatIsolationCapsule(`Hacker Cross / Round ${round}`, [
+        `Visible artifacts: only stored hacker skill outputs from round ${round}, plus the latest tester plans.`,
+        "Hidden by Sentinel: future hacker rounds and raw host conversation history.",
+      ]);
+      const crossPrompt = HACKER_CROSS_PROMPT.replace("{ROUND}", String(round)).replace("{SKILL_RESULTS}", skillResultsForRound);
       const nextHint = [
         "", "---",
-        `Count your NEW chain attacks.`,
-        `- ≥ 2 new: call sentinel_hack with skill=1 for Round ${round + 1}.`,
-        `- < 2 new: CONVERGE. Call sentinel_hack with skill="merge" and skillResults=<everything>.`,
-        round >= 3 ? `- **Round 3 reached — MUST converge. Call skill="merge" next.**` : "",
+        `After generating chain attacks, store them by calling sentinel_hack with skill="cross" and skillResults=<your output>.`,
+        `- If the stored cross result found ≥ 2 new attacks: open round ${round + 1} with skill=1.`,
+        `- If it converged: call sentinel_hack with skill="merge" to merge only the stored hacker artifacts.`,
+        round >= 3 ? `- **Round 3 reached — MUST converge after storing this pass.**` : "",
       ].join("\n");
-      hackRound.set(SESSION, round + 1);
-      return text([`# Hacker Cross-Pollination — Round ${round}`, "", crossPrompt, nextHint].join("\n"));
+      return text([`# Hacker Cross-Pollination — Round ${round}`, "", capsule, "", crossPrompt, nextHint].join("\n"));
     }
 
     // Branch 3: Final merge
     if (skill === "merge") {
-      if (!skillResults) return text("Error: skill='merge' requires skillResults parameter.");
+      if (skillResults) {
+        const artifact = isolationVault.store(SESSION, "hack_merge", skillResults);
+        return text([
+          `# Hacker Merge Stored`,
+          "",
+          `Stored ${describeArtifact(artifact)} inside Sentinel's isolation vault.`,
+          `Next: have the host coding agent write the final merged test files and run them in its own terminal or sandbox.`,
+        ].join("\n"));
+      }
       hackRound.delete(SESSION);
-      const mergePrompt = HACKER_MERGE_PROMPT.replace("{TESTER_PLAN}", combinedPlan).replace("{ALL_RESULTS}", skillResults);
-      return text([`# Hacker Final Merge`, "", mergePrompt].join("\n"));
+      const allResults = getAllHackResults(SESSION);
+      if (!allResults) return text("Error: No stored hacker artifacts found. Run and store hacker phases first.");
+      const capsule = formatIsolationCapsule("Hacker Merge", [
+        "Visible artifacts: latest stored tester plans plus stored hacker skill and cross outputs.",
+        "Hidden by Sentinel: PM tier raw outputs that were not promoted into tester-visible artifacts.",
+      ]);
+      const mergePrompt = HACKER_MERGE_PROMPT.replace("{TESTER_PLAN}", combinedPlan).replace("{ALL_RESULTS}", allResults);
+      return text([`# Hacker Final Merge`, "", capsule, "", mergePrompt].join("\n"));
     }
 
     // Branch 4: Legacy mode
@@ -875,65 +1110,55 @@ server.tool(
       allSkills, "",
       HACKER_OUTPUT_FORMAT.replace("{SKILL_ID}", "N"), "",
       `Merge: keep ALL Tester tests [T], add Hacker attacks [H], upgrade overlaps [T+H].`,
-      `Present merged plan. After approval, call sentinel_run.`,
+      HOST_EXECUTION_GUIDANCE,
     ].join("\n"));
   },
 );
 
 // ══════════════════════════════════════════
-// Tool 6: sentinel_run — Execute tests
+// Tool 6: sentinel_report — Final T-tier report
 // ══════════════════════════════════════════
 
 server.tool(
-  "sentinel_run",
-  "Execute test files in an isolated workspace. Pass test file contents as key-value pairs. Call AFTER the merged test plan is approved.",
+  "sentinel_report",
+  "Turn host-run failure items into a final T-tier report. Pass only raw failure evidence from the host test run.",
   {
-    target: z.string().describe("Absolute path to the project directory"),
-    testFiles: z.record(z.string()).describe('Map of filename -> file content. Example: {"functional.test.ts": "import { describe ... }"}'),
-    save: z.boolean().optional().describe("If true, save test files to the target project after execution"),
+    failures: z.array(z.object({
+      testName: z.string().describe("Test name from the host test run"),
+      failureType: z.string().describe("Failure type such as test, setup, compile, collection, timeout, or runtime"),
+      errorMessage: z.string().describe("Raw error message for this failure item"),
+      testFile: z.string().optional().describe("Optional test file path reported by the host"),
+    })).describe("Failure items from the host coding agent's test run"),
+    totalTests: z.number().optional().describe("Optional total number of tests executed"),
+    passed: z.number().optional().describe("Optional number of passed tests"),
+    failed: z.number().optional().describe("Optional number of failed tests"),
+    durationSeconds: z.number().optional().describe("Optional execution duration in seconds"),
   },
-  async ({ target, testFiles, save }) => {
-    const scanResult = lastScanResults.get(SESSION);
-    if (!scanResult) return text("Error: No scan result found. Call sentinel_scan first.");
-
-    const ws = createWorkspace(target, scanResult.language);
-    activeWorkspaces.set(SESSION, ws);
-
-    try {
-      const installResult = await installDeps(ws);
-      if (!installResult.success) {
-        destroyWorkspace(ws);
-        activeWorkspaces.delete(SESSION);
-        return text(`## Dependency installation failed\n\n\`\`\`\n${installResult.output.slice(0, 2000)}\n\`\`\`\n\nFix the dependency issue and try again.`);
+  async ({ failures, totalTests, passed, failed, durationSeconds }) => {
+    if (failures.length === 0) {
+      const lines = [
+        `# Sentinel Final Report`,
+        "",
+        `No failure items were provided.`,
+      ];
+      if (typeof totalTests === "number" || typeof passed === "number" || typeof failed === "number") {
+        lines.push("", `Summary: total=${totalTests ?? 0}, passed=${passed ?? 0}, failed=${failed ?? 0}`);
       }
-
-      writeTestFiles(ws, testFiles);
-      const testResult = await runTests(ws);
-      const report = formatReport(scanResult, testResult);
-      let output = report.summary + "\n" + report.details;
-
-      if (testResult.failures.length > 0) {
-        output += "\n### Failure Analysis Context\n";
-        output += formatFailureContext(testResult);
-        output += "\nAnalyze the failures above. For each failure:\n";
-        output += "1. Identify the root cause in the source code\n";
-        output += "2. Determine if it's a bug in the code or a bug in the test\n";
-        output += "3. If it's a code bug, suggest a specific fix\n";
-      }
-
-      if (save) {
-        const savedDir = saveTestFiles(ws, target);
-        output += `\n\nTest files saved to: ${savedDir}`;
-      }
-
-      destroyWorkspace(ws);
-      activeWorkspaces.delete(SESSION);
-      return text(output);
-    } catch (err: any) {
-      destroyWorkspace(ws);
-      activeWorkspaces.delete(SESSION);
-      return text(`sentinel run error: ${err?.message || err}`);
+      return text(lines.join("\n"));
     }
+
+    return text(formatTierReportInput({
+      failures: failures.map((failure) => ({
+        testName: failure.testName,
+        failureType: failure.failureType,
+        errorMessage: failure.errorMessage,
+        testFile: failure.testFile,
+      })),
+      totalTests,
+      passed,
+      failed,
+      durationSeconds,
+    }));
   },
 );
 

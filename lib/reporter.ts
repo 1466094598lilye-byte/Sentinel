@@ -1,9 +1,10 @@
 /**
  * Format test results into structured reports.
- * Deterministic — no LLM needed.
+ * Deterministic summaries only. Final T-tier judgment should be done
+ * one failure at a time by the host model using raw failure evidence.
  */
 
-import type { TestResult, FailureDetail } from "./executor.js";
+import type { TestResult, FailureDetail, FailureType } from "./executor.js";
 import type { ScanResult } from "./detect.js";
 
 export interface Report {
@@ -13,65 +14,30 @@ export interface Report {
   overall: "PASS" | "FAIL";
 }
 
-// ── Triage: classify failures by severity ──
-
-type TrafficLight = "red" | "yellow" | "green";
-
-interface TriagedFailure {
-  light: TrafficLight;
-  failure: FailureDetail;
-  reason: string;
+export interface FailureEvidenceInput {
+  testName: string;
+  failureType: FailureType | string;
+  errorMessage: string;
+  testFile?: string;
 }
 
-const RED_PATTERNS = [
-  /\bTier\s*1\b/i, /\bT1\b/, /\bUX-T1\b/,
-  /\bTier\s*2\b/i, /\bT2\b/, /\bUX-T2\b/,
-  /\bSkill\s*3\b/i, /\bSilent Wrong/i,    // silent wrong answers
-  /\bSkill\s*5\b/i, /\bInjection/i,        // injection & escalation
-  /\bdata\s*loss/i, /\bsecurity/i, /\bcorrupt/i,
-  /\bCR-[12]\b/,                            // research: critical category risks
-];
-
-const YELLOW_PATTERNS = [
-  /\bTier\s*3\b/i, /\bT3\b/, /\bUX-T3\b/,
-  /\bSkill\s*2\b/i, /\bState Corruption/i,
-  /\bSkill\s*4\b/i, /\bResource Exhaustion/i,
-  /\bSkill\s*6\b/i, /\bTemporal/i,
-  /\bCR-[3-5]\b/,                           // research: medium category risks
-];
-
-function triageFailure(f: FailureDetail): TriagedFailure {
-  const text = `${f.testFile} ${f.testName} ${f.error || ""}`;
-
-  for (const pat of RED_PATTERNS) {
-    if (pat.test(text)) {
-      return { light: "red", failure: f, reason: "T1/T2 or critical attack vector" };
-    }
-  }
-  for (const pat of YELLOW_PATTERNS) {
-    if (pat.test(text)) {
-      return { light: "yellow", failure: f, reason: "T3 or state/resource issue" };
-    }
-  }
-  return { light: "green", failure: f, reason: "T4 or low-priority" };
+export interface TierReportInput {
+  failures: FailureEvidenceInput[];
+  totalTests?: number;
+  passed?: number;
+  failed?: number;
+  durationSeconds?: number;
 }
 
-function lightEmoji(light: TrafficLight): string {
-  switch (light) {
-    case "red": return "[RED]";
-    case "yellow": return "[YLW]";
-    case "green": return "[GRN]";
-  }
-}
-
-/** Generate a structured markdown report with triage */
+/** Generate a structured markdown report with raw failure evidence only. */
 export function formatReport(scan: ScanResult, result: TestResult): Report {
   const overall = result.exitCode === 0 && result.failed === 0 ? "PASS" : "FAIL";
   const passRate = result.totalTests > 0 ? result.passed / result.totalTests : 0;
 
   const summary = [
     `## Sentinel Report: ${scan.language} project`,
-    `Scope: ${scan.scope}`,
+    `Context: full repository scan`,
+    `Validation tree: current checkout`,
     scan.changedFiles.length > 0 ? `Changed files: ${scan.changedFiles.join(", ")}` : `Changed files: all`,
     "",
     `### Summary`,
@@ -82,35 +48,9 @@ export function formatReport(scan: ScanResult, result: TestResult): Report {
   let details = "";
 
   if (result.failures.length > 0) {
-    // Triage all failures
-    const triaged = result.failures.map(triageFailure);
-    const reds = triaged.filter((t) => t.light === "red");
-    const yellows = triaged.filter((t) => t.light === "yellow");
-    const greens = triaged.filter((t) => t.light === "green");
-
-    // Triage summary
-    details += "\n### Triage\n";
-    details += `${reds.length} critical (fix now) | ${yellows.length} important (fix soon) | ${greens.length} minor (fix when possible)\n`;
-
-    if (reds.length > 0) {
-      details += "\n### [RED] Fix Now — Blocks Ship\n\n";
-      for (const t of reds) {
-        details += formatTriagedFailure(t);
-      }
-    }
-
-    if (yellows.length > 0) {
-      details += "\n### [YLW] Fix Soon — Degrades Experience\n\n";
-      for (const t of yellows) {
-        details += formatTriagedFailure(t);
-      }
-    }
-
-    if (greens.length > 0) {
-      details += "\n### [GRN] Fix When Possible — Low Priority\n\n";
-      for (const t of greens) {
-        details += formatTriagedFailure(t);
-      }
+    details += "\n### Failures\n\n";
+    for (const failure of result.failures) {
+      details += formatFailureRecord(failure);
     }
   }
 
@@ -121,10 +61,9 @@ export function formatReport(scan: ScanResult, result: TestResult): Report {
   return { summary, details, passRate, overall };
 }
 
-function formatTriagedFailure(t: TriagedFailure): string {
-  const f = t.failure;
-  const lines = [`#### ${lightEmoji(t.light)} ${f.testFile} > ${f.testName}`];
-  lines.push(`- **Priority:** ${t.reason}`);
+function formatFailureRecord(f: FailureDetail): string {
+  const lines = [`#### ${f.testFile || "(global)"} > ${f.testName}`];
+  lines.push(`- **Failure Type:** ${f.failureType}`);
   if (f.error) lines.push(`- **Error:** ${truncate(f.error, 300)}`);
   if (f.expected) lines.push(`- **Expected:** ${f.expected}`);
   if (f.actual) lines.push(`- **Actual:** ${f.actual}`);
@@ -138,27 +77,6 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max) + "...";
 }
 
-// ── Seeded PRNG for deterministic shuffling ──
-
-function seededShuffle<T>(arr: T[], seed: number): T[] {
-  const copy = [...arr];
-  // LCG: a=1664525, c=1013904223, m=2^32
-  let s = seed >>> 0;
-  const next = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0x100000000; };
-  // Fisher-Yates
-  for (let i = copy.length - 1; i > 0; i--) {
-    const j = Math.floor(next() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-  return copy;
-}
-
-/** Format scan context with shuffled API surface order (for Hacker sub-agent diversity) */
-export function formatScanContextShuffled(scan: ScanResult, seed: number): string {
-  const shuffled = { ...scan, apiSurface: seededShuffle(scan.apiSurface, seed) };
-  return formatScanContext(shuffled);
-}
-
 /** Format scan result as context for the agent to generate test plans */
 /** Format scan context for LLM prompts — includes full source code. */
 export function formatScanContext(scan: ScanResult): string {
@@ -166,7 +84,8 @@ export function formatScanContext(scan: ScanResult): string {
 
   lines.push(`# Test Context`);
   lines.push(`Language: ${scan.language}`);
-  lines.push(`Scope: ${scan.scope}`);
+  lines.push(`Context: full repository scan`);
+  lines.push(`Validation tree: current checkout`);
   lines.push("");
 
   if (scan.changedFiles.length > 0) {
@@ -252,17 +171,71 @@ export function formatFailureContext(result: TestResult): string {
   if (result.failures.length === 0) return "";
 
   const lines: string[] = [];
-  lines.push(`The following tests FAILED. Analyze each failure and suggest fixes.`);
-  lines.push(`These are REAL test failures from the test runner — not LLM judgment.`);
+  lines.push(`The following failure items are raw runner evidence.`);
+  lines.push(`Classify each item independently into a final T-tier using ONLY test_name, failure_type, and error_message.`);
   lines.push("");
 
-  for (const f of result.failures) {
-    lines.push(`### [FAIL] ${f.testName}`);
-    lines.push(`File: ${f.testFile}`);
-    if (f.error) lines.push(`Error: ${truncate(f.error, 500)}`);
-    if (f.stackLine) lines.push(`Location: ${f.stackLine}`);
+  for (const [index, f] of result.failures.entries()) {
+    lines.push(`### Failure ${index + 1}`);
+    lines.push(`test_name: ${f.testName}`);
+    lines.push(`failure_type: ${f.failureType}`);
+    lines.push(`error_message: ${JSON.stringify(truncate(f.error || "", 500))}`);
     lines.push("");
   }
+
+  return lines.join("\n");
+}
+
+export function formatTierReportInput(input: TierReportInput): string {
+  const lines: string[] = [];
+  lines.push(`# Sentinel Final Report`);
+  lines.push(`Use ONLY the failure items below.`);
+  lines.push(`Do NOT use source code, prior assumptions, or architectural guesses.`);
+  lines.push(`Assign each failure a final T-tier based on actual user impact implied by the failure evidence.`);
+  lines.push("");
+
+  if (typeof input.totalTests === "number" || typeof input.passed === "number" || typeof input.failed === "number") {
+    const total = typeof input.totalTests === "number" ? input.totalTests : input.failures.length;
+    const passed = typeof input.passed === "number" ? input.passed : Math.max(0, total - (input.failed || 0));
+    const failed = typeof input.failed === "number" ? input.failed : input.failures.length;
+    const duration = typeof input.durationSeconds === "number" ? `${input.durationSeconds.toFixed(1)}s` : "unknown";
+    lines.push(`## Run Summary`);
+    lines.push(`- Total tests: ${total}`);
+    lines.push(`- Passed: ${passed}`);
+    lines.push(`- Failed: ${failed}`);
+    lines.push(`- Duration: ${duration}`);
+    lines.push("");
+  }
+
+  lines.push(`## T-Tier Definitions`);
+  lines.push(`- T1 — Immediate abandonment: one incident can make a user leave or stop trusting the product immediately.`);
+  lines.push(`- T2 — Rapid trust erosion: not instant abandonment, but trust breaks within a few incidents.`);
+  lines.push(`- T3 — Cumulative frustration: clearly bad and user-visible, but still usually tolerable in the short term.`);
+  lines.push(`- T4 — Background dissatisfaction: low-severity, edge-case, or likely test/harness issue with limited real user impact.`);
+  lines.push("");
+
+  lines.push(`## Failure Evidence`);
+  input.failures.forEach((failure, index) => {
+    lines.push(`### Failure ${index + 1}`);
+    lines.push(`test_name: ${failure.testName}`);
+    lines.push(`failure_type: ${failure.failureType}`);
+    if (failure.testFile) lines.push(`test_file: ${failure.testFile}`);
+    lines.push(`error_message: ${JSON.stringify(truncate(failure.errorMessage || "", 500))}`);
+    lines.push("");
+  });
+
+  lines.push(`## Output Format`);
+  lines.push(`Return one item per failure in this exact shape:`);
+  lines.push("```json");
+  lines.push("[");
+  lines.push('  { "test_name": "string", "tier": "T1|T2|T3|T4", "why_user_cares": "one sentence" }');
+  lines.push("]");
+  lines.push("```");
+  lines.push("");
+  lines.push(`Rules:`);
+  lines.push(`- Judge the observed failure, not the importance of the component in the abstract.`);
+  lines.push(`- If the evidence suggests a likely test harness/setup artifact with limited user impact, prefer T4.`);
+  lines.push(`- Do not invent details not present in the failure evidence.`);
 
   return lines.join("\n");
 }

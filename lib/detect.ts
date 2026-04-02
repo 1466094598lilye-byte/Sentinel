@@ -1,5 +1,5 @@
 /**
- * Language detection and git diff analysis.
+ * Language detection and repository context analysis.
  * All deterministic — no LLM needed.
  */
 
@@ -11,7 +11,7 @@ export type Language = "typescript" | "javascript" | "python" | "go" | "rust" | 
 
 export interface ScanResult {
   language: Language;
-  scope: "commit" | "branch" | "changes" | "full";
+  targetDir: string;
   changedFiles: string[];
   sourceFiles: string[];
   sourceContents: Record<string, string>;
@@ -46,8 +46,12 @@ const STRONG_SIGNALS: [string | string[], Language][] = [
 const EXTENSION_MAP: Record<string, Language> = {
   ".ts": "typescript",
   ".tsx": "typescript",
+  ".mts": "typescript",
+  ".cts": "typescript",
   ".js": "javascript",
   ".jsx": "javascript",
+  ".mjs": "javascript",
+  ".cjs": "javascript",
   ".py": "python",
   ".go": "go",
   ".rs": "rust",
@@ -100,7 +104,7 @@ export function detectLanguage(targetDir: string): Language {
   return "unknown";
 }
 
-// ── Git scope detection ──
+// ── Git context detection ──
 
 function exec(cmd: string, cwd: string): string {
   try {
@@ -114,84 +118,53 @@ function isGitRepo(dir: string): boolean {
   return exec("git rev-parse --is-inside-work-tree", dir) === "true";
 }
 
-function getDefaultBranch(dir: string): string {
-  // Try common names
+function getComparisonRef(dir: string): string {
+  const upstream = exec("git rev-parse --abbrev-ref --symbolic-full-name @{upstream}", dir);
+  if (upstream) return upstream;
+
+  const originHead = exec("git symbolic-ref --quiet refs/remotes/origin/HEAD", dir);
+  if (originHead.startsWith("refs/remotes/")) {
+    return originHead.replace(/^refs\/remotes\//, "");
+  }
+
   for (const branch of ["main", "master"]) {
     if (exec(`git rev-parse --verify ${branch}`, dir)) return branch;
   }
-  return "main";
+  return "";
 }
 
-export function detectScope(
-  targetDir: string,
-  explicitScope?: string,
-): { scope: ScanResult["scope"]; changedFiles: string[]; gitDiff: string } {
-  if (explicitScope && ["commit", "branch", "changes", "full"].includes(explicitScope)) {
-    // Even with explicit scope, still get the relevant files
-    return getFilesForScope(targetDir, explicitScope as ScanResult["scope"]);
-  }
-
+export function collectGitContext(targetDir: string): Pick<ScanResult, "changedFiles" | "gitDiff"> {
   if (!isGitRepo(targetDir)) {
-    return { scope: "full", changedFiles: [], gitDiff: "" };
+    return { changedFiles: [], gitDiff: "" };
   }
 
-  // Check uncommitted changes (staged + unstaged)
   const staged = exec("git diff --cached --name-only", targetDir);
   const unstaged = exec("git diff --name-only", targetDir);
-  const uncommitted = [...new Set([...staged.split("\n"), ...unstaged.split("\n")])].filter(Boolean);
+  const worktreeFiles = [...new Set([...staged.split("\n"), ...unstaged.split("\n")])].filter(Boolean);
+  const worktreeDiff = exec("git diff HEAD", targetDir) || exec("git diff --cached", targetDir) || exec("git diff", targetDir);
 
-  if (uncommitted.length > 0) {
-    const diff = exec("git diff HEAD", targetDir) || exec("git diff", targetDir);
-    return { scope: "commit", changedFiles: uncommitted, gitDiff: diff };
-  }
-
-  // Check branch divergence
-  const defaultBranch = getDefaultBranch(targetDir);
+  const comparisonRef = getComparisonRef(targetDir);
   const currentBranch = exec("git rev-parse --abbrev-ref HEAD", targetDir);
+  const branchFiles = comparisonRef && currentBranch && currentBranch !== comparisonRef
+    ? exec(`git diff --name-only ${comparisonRef}...HEAD`, targetDir).split("\n").filter(Boolean)
+    : [];
+  const branchDiff = comparisonRef && currentBranch && currentBranch !== comparisonRef
+    ? exec(`git diff ${comparisonRef}...HEAD`, targetDir)
+    : "";
 
-  if (currentBranch && currentBranch !== defaultBranch) {
-    const branchFiles = exec(`git diff --name-only ${defaultBranch}...HEAD`, targetDir);
-    const branchDiff = exec(`git diff ${defaultBranch}...HEAD`, targetDir);
-    const files = branchFiles.split("\n").filter(Boolean);
-    if (files.length > 0) {
-      return { scope: "branch", changedFiles: files, gitDiff: branchDiff };
-    }
-  }
+  const changedFiles = [...new Set([...worktreeFiles, ...branchFiles])];
 
-  // No changes detected — full scan
-  return { scope: "full", changedFiles: [], gitDiff: "" };
-}
+  const diffParts = [branchDiff, worktreeDiff].filter(Boolean);
+  const gitDiff = diffParts.join("\n");
 
-function getFilesForScope(
-  targetDir: string,
-  scope: ScanResult["scope"],
-): { scope: ScanResult["scope"]; changedFiles: string[]; gitDiff: string } {
-  if (scope === "full") return { scope, changedFiles: [], gitDiff: "" };
-  if (!isGitRepo(targetDir)) return { scope: "full", changedFiles: [], gitDiff: "" };
-
-  const defaultBranch = getDefaultBranch(targetDir);
-
-  if (scope === "commit") {
-    const files = exec("git diff HEAD --name-only", targetDir).split("\n").filter(Boolean);
-    const diff = exec("git diff HEAD", targetDir);
-    return { scope, changedFiles: files, gitDiff: diff };
-  }
-  if (scope === "branch") {
-    const files = exec(`git diff --name-only ${defaultBranch}...HEAD`, targetDir).split("\n").filter(Boolean);
-    const diff = exec(`git diff ${defaultBranch}...HEAD`, targetDir);
-    return { scope, changedFiles: files, gitDiff: diff };
-  }
-  // changes — same as commit
-  const files = exec("git diff HEAD --name-only", targetDir).split("\n").filter(Boolean);
-  const diff = exec("git diff HEAD", targetDir);
-  return { scope, changedFiles: files, gitDiff: diff };
+  return { changedFiles, gitDiff };
 }
 
 // ── Source file discovery ──
 
 const LANGUAGE_EXTENSIONS: Record<Language, string[]> = {
-  typescript: [".ts", ".tsx"],
-  javascript: [".js", ".jsx"],
+  typescript: [".ts", ".tsx", ".mts", ".cts"],
+  javascript: [".js", ".jsx", ".mjs", ".cjs"],
   python: [".py"],
   go: [".go"],
   rust: [".rs"],
@@ -205,7 +178,7 @@ const LANGUAGE_EXTENSIONS: Record<Language, string[]> = {
 const IGNORE_DIRS = [
   "node_modules", "dist", ".git", "__pycache__", "venv", ".venv",
   "build", "coverage", "target", "vendor", ".build", "bin", "obj",
-  "Pods", ".gradle", ".idea",
+  "Pods", ".gradle", ".idea", ".yarn", ".pnpm-store",
 ];
 
 const TEST_PATTERNS = [
@@ -243,6 +216,7 @@ function walkDir(dir: string, base: string, extensions: string[]): string[] {
   }
   return results;
 }
+
 
 function extensionsForLanguage(language: Language): string[] {
   return LANGUAGE_EXTENSIONS[language] || [];
@@ -717,27 +691,13 @@ export function readDependencies(targetDir: string, language: Language): Record<
 
 // ── Full scan ──
 
-export function scan(targetDir: string, explicitScope?: string): ScanResult {
+export function scan(targetDir: string): ScanResult {
   const language = detectLanguage(targetDir);
-  const { scope, changedFiles, gitDiff } = detectScope(targetDir, explicitScope);
+  const { changedFiles, gitDiff } = collectGitContext(targetDir);
 
   const allSourceFiles = findSourceFiles(targetDir, language);
   const existingTests = findTestFiles(targetDir, language);
-
-  // For non-full scopes, filter source files to changed + their imports
-  let sourceFiles: string[];
-  if (scope === "full" || changedFiles.length === 0) {
-    sourceFiles = allSourceFiles;
-  } else {
-    // Include changed files + all source files (for import context)
-    // The agent will focus on changed files, but needs to see imports
-    const exts = extensionsForLanguage(language);
-    const changedSourceFiles = changedFiles.filter((f) =>
-      exts.some((ext) => f.endsWith(ext)),
-    );
-    sourceFiles = [...new Set([...changedSourceFiles, ...allSourceFiles])];
-  }
-
+  const sourceFiles = allSourceFiles;
   const apiSurface = extractApiSurface(targetDir, sourceFiles, language);
   const dependencies = readDependencies(targetDir, language);
 
@@ -764,7 +724,7 @@ export function scan(targetDir: string, explicitScope?: string): ScanResult {
 
   return {
     language,
-    scope,
+    targetDir,
     changedFiles,
     sourceFiles,
     sourceContents,

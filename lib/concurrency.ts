@@ -74,13 +74,14 @@ export interface ExecResult {
 
 export function execAsync(
   cmd: string,
-  opts: { cwd: string; timeout?: number; env?: Record<string, string | undefined> },
+  opts: { cwd: string; timeout?: number; env?: Record<string, string | undefined>; inheritEnv?: boolean },
 ): Promise<ExecResult> {
   const cfg = getConfig();
   const maxBuffer = cfg?.maxOutputBuffer || 10 * 1024 * 1024;
 
   return new Promise((resolve) => {
-    const env = opts.env ? { ...process.env, ...opts.env } : process.env;
+    const baseEnv = opts.inheritEnv === false ? {} : process.env;
+    const env = opts.env ? { ...baseEnv, ...opts.env } : baseEnv;
 
     exec(
       cmd,
